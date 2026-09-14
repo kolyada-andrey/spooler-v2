@@ -11,8 +11,15 @@ import uuid
 from pathlib import Path
 
 import state
+from persistence import save_tray_map
 from printers.base import PrinterConnection
-from spoolman import spoolman_assign, spoolman_set_location
+from spoolman import (
+    infer_material_from_name,
+    parse_cc2_filename,
+    spoolman_find_or_create_by_material_color,
+    spoolman_set_location,
+    spoolman_assign,
+)
 from printers.protocol import (
     CMD_LIGHT, CMD_PAUSE, CMD_RESUME, CMD_STOP,
     deep_merge,
@@ -275,7 +282,8 @@ class CC2Connection(PrinterConnection):
                 if self._expected_filament_g or self._expected_print_time_s:
                     print(f"[Printer {self.name}] File metadata: "
                           f"{self._expected_filament_g}g / {self._expected_print_time_s}s")
-                    print(f"[Printer {self.name}] 1046 full response: {json.dumps(inner)[:600]}")
+                print(f"[Printer {self.name}] 1046 full response: {json.dumps(inner)[:600]}")
+                asyncio.create_task(self._auto_link_spools_from_metadata(inner))
                 return
 
             source = inner if isinstance(inner, dict) else payload
@@ -403,6 +411,125 @@ class CC2Connection(PrinterConnection):
                 "error": "File list request timed out.",
             })
 
+    async def _auto_link_spools_from_metadata(self, meta: dict) -> None:
+        """Link CC2 trays to exact material/color matches in Spoolman."""
+        color_map = meta.get("color_map")
+        meta_filename = str(meta.get("filename") or "")
+        current_filename = str(self._current_filename or "")
+        filename_meta = parse_cc2_filename(meta_filename or current_filename)
+        if not isinstance(color_map, list):
+            color_map = []
+        if not color_map and filename_meta:
+            filament_name = filename_meta.get("filament_name", "")
+            material = (
+                filename_meta.get("material")
+                or infer_material_from_name(filament_name)
+            )
+            if material:
+                color_map = [{
+                    "name": material,
+                    "color": filename_meta.get("color_hex"),
+                    "t": 0,
+                }]
+        if not color_map:
+            return
+
+        print_state = self._cc2_state.get("print_status", {}).get("state", "")
+        if print_state not in ("printing", "paused"):
+            return
+
+        if (
+            meta_filename
+            and current_filename
+            and Path(meta_filename).name != Path(current_filename).name
+        ):
+            print(
+                f"[Printer {self.name}] Auto-match ignored: metadata file "
+                f"{meta_filename!r} != current file {current_filename!r}"
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        matched_spools = []
+        mapping_changed = False
+
+        for item in color_map:
+            if not isinstance(item, dict):
+                continue
+
+            material = str(
+                filename_meta.get("material") or item.get("name") or ""
+            ).strip()
+            # The slicer's color_map can contain its generic preview color
+            # (#000000 in particular). The configured output filename carries
+            # default_filament_colour and is authoritative when present.
+            color = str(
+                filename_meta.get("color_hex") or item.get("color") or ""
+            ).strip()
+            filament_name = str(
+                filename_meta.get("display_name")
+                or filename_meta.get("filament_name")
+                or ""
+            ).strip()
+            vendor_name = str(filename_meta.get("vendor_name") or "").strip()
+            try:
+                tray_id = int(item.get("t", 0))
+            except (TypeError, ValueError):
+                tray_id = 0
+
+            if not material or not color:
+                continue
+
+            spool = await loop.run_in_executor(
+                None,
+                spoolman_find_or_create_by_material_color,
+                material,
+                color,
+                self.id,
+                filament_name,
+                vendor_name,
+            )
+            if not spool:
+                continue
+
+            spool_id = int(spool["id"])
+            printer_trays = state.tray_map.setdefault(self.id, {})
+            tray_key = str(tray_id)
+            if printer_trays.get(tray_key) != spool_id:
+                printer_trays[tray_key] = spool_id
+                mapping_changed = True
+
+            matched_spools.append(spool_id)
+            await loop.run_in_executor(
+                None, spoolman_set_location, spool_id, self.id
+            )
+
+            density = (spool.get("filament") or {}).get("density")
+            if density:
+                try:
+                    self.filament_density = float(density)
+                except (TypeError, ValueError):
+                    pass
+
+            print(
+                f"[Printer {self.name}] Auto-linked Slot {tray_id + 1} → "
+                f"Spool {spool_id} ({material} {color})"
+            )
+
+        if mapping_changed:
+            await loop.run_in_executor(None, save_tray_map, state.tray_map)
+            await state.broadcast_to_browsers({
+                "type": "tray_map",
+                "tray_map": state.tray_map,
+            })
+
+        if len(matched_spools) == 1:
+            self._current_print_spool = matched_spools[0]
+            print(
+                f"[Printer {self.name}] Current print spool → "
+                f"{matched_spools[0]}"
+            )
+
     async def start_print_file(self, filename: str, print_opts: dict | None = None) -> bool:
         self._current_filename = filename
         opts = print_opts or {}
@@ -473,7 +600,15 @@ class CC2Connection(PrinterConnection):
         total    = print_duration + remaining
         progress = min(100, round(print_duration / total * 100)) if total > 0 else 0
 
-        new_print = state_str == "printing" and self._prev_state_str not in ("printing", "paused")
+        prev_state_str = self._prev_state_str
+        print_ending = (
+            state_str in ("complete", "standby", "cancelled", "error")
+            and prev_state_str in ("printing", "paused")
+        )
+        new_print = (
+            state_str == "printing"
+            and prev_state_str not in ("printing", "paused")
+        )
         if new_print:
             self._filament_mm_max        = 0.0
             self._extruder_offset        = 0.0
@@ -482,7 +617,7 @@ class CC2Connection(PrinterConnection):
             self._expected_print_time_s  = 0
             self._last_active_filament_mm = 0.0
             fname = self._current_filename
-            if fname and fname != self._meta_fetch_filename:
+            if fname:
                 self._meta_fetch_filename = fname
                 try:
                     loop = asyncio.get_running_loop()
@@ -492,15 +627,15 @@ class CC2Connection(PrinterConnection):
                 except RuntimeError:
                     pass
 
-        if state_str:
-            self._prev_state_str = state_str
-
         # CC2 MQTT never sends filament_used or reliable gcode_move.extruder.
         # Use time-progress × expected grams (from method 1046) instead.
         if self._expected_filament_g > 0:
             density = self.filament_density or 1.24
             expected_mm = self._expected_filament_g * 10.0 / (math.pi * 0.0875 ** 2 * density)
-            just_finished = state_str in ("complete", "standby") and self._prev_state_str in ("printing", "paused")
+            just_finished = (
+                state_str in ("complete", "standby")
+                and prev_state_str in ("printing", "paused")
+            )
             if state_str == "printing" and (print_duration + remaining) > 0:
                 filament_mm = print_duration / (print_duration + remaining) * expected_mm
                 self._last_active_filament_mm = filament_mm
@@ -518,6 +653,22 @@ class CC2Connection(PrinterConnection):
                 self._extruder_offset += self._last_extruder
             self._last_extruder = raw_ext
             filament_mm = max(self._filament_mm_max, self._extruder_offset + raw_ext)
+
+        # CC2 reports active_tray_id=-1 for ordinary single-material prints.
+        # If the base tracker lost the asynchronously auto-selected spool, recover
+        # the exact spool most recently linked to Slot 1 instead of falling back
+        # to the first Spoolman item sharing the printer location.
+        if print_ending and self._current_print_spool is None:
+            slot_one_spool = (state.tray_map.get(self.id) or {}).get("0")
+            if slot_one_spool is not None:
+                self._current_print_spool = int(slot_one_spool)
+                print(
+                    f"[Printer {self.name}] Restored current print spool from "
+                    f"Slot 1 → {slot_one_spool}"
+                )
+
+        if state_str:
+            self._prev_state_str = state_str
 
         led    = s.get("led", {})
         led_on = 1 if (led.get("status", 0) or 0) > 0 else 0

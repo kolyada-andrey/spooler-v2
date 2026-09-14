@@ -162,6 +162,14 @@ Spooler integrates with **[Spoolman](https://github.com/Donkie/Spoolman)**, an o
 - Add spools manually
 - **Import Elegoo** imports all 97 ELEGOO filament types from SpoolmanDB in one click
 - Spool **location** in Spoolman is set automatically to the printer's name (e.g. `CC2`) whenever a spool is linked to a slot or the printer connects — no manual setup needed
+- CC2 can automatically match or create spools from print metadata. The optional
+  Use the universal OrcaSlicer output filename format
+  `ECC2@VENDOR={filament_vendor[initial_tool]}@MATERIAL={filament_type[initial_tool]}@COLOR={default_filament_colour[initial_tool]}@NOZZLE={nozzle_diameter[0]}@MODEL={input_filename_base}@TIME={print_time}.gcode`.
+  Existing filament types are matched by vendor, material, and exact RGB color.
+  An optional `@NAME=Orange` field may be added when a new filament type should
+  be created with a human-readable name.
+  supplies the filament name and a fallback color. Set `SPOOLMAN_AUTO_CREATE=false`
+  to disable creation or `SPOOLMAN_DEFAULT_SPOOL_WEIGHT=1000` to change its initial weight.
 
 By default, Spooler proxies the Spoolman UI through itself (so one port covers everything). To redirect the browser directly to Spoolman instead — useful if you run a separate reverse proxy or need better WebSocket support — set `PROXY_SPOOLMAN=false` in your `.env` file.
 
