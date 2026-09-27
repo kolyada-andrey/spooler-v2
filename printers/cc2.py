@@ -535,7 +535,14 @@ class CC2Connection(PrinterConnection):
             return
 
         print_state = self._cc2_state.get("print_status", {}).get("state", "")
-        if print_state not in ("printing", "paused"):
+        normalized_status = self._decoded_printinfo().get("Status")
+        # Newer firmware may omit print_status.state and expose the active
+        # phase only through machine_status.sub_status.  _apply_cc2_status()
+        # has already normalized that value into PrintInfo.Status.
+        if (
+            print_state not in ("printing", "paused")
+            and normalized_status not in (2, 3, 4, 5, 6, 7, 13)
+        ):
             return
 
         if (
