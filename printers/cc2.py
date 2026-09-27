@@ -87,10 +87,16 @@ class CC2Connection(PrinterConnection):
         self._prev_active_tray_id = -2  # sentinel: not yet seen
         self._pending_thumb_fut: asyncio.Future | None = None
         self._pending_meta_fut:  asyncio.Future | None = None
+        self._pending_thumb_filename = ""
+        self._pending_meta_filename  = ""
+        self._file_info_lock = asyncio.Lock()
         self._expected_filament_g    = 0.0  # from method 1046 at print start
         self._expected_print_time_s  = 0    # from method 1046 at print start
         self._last_active_filament_mm = 0.0 # snapshot for cancelled prints
-        self._meta_fetch_filename    = ""   # avoid duplicate 1046 fetches
+        self._tracked_print_filename = ""
+        self._current_print_metadata: dict | None = None
+        self._print_metadata_task: asyncio.Task | None = None
+        self._print_metadata_event: asyncio.Event | None = None
 
     async def connect(self) -> None:
         self._prev_active_tray_id = -2
@@ -114,13 +120,15 @@ class CC2Connection(PrinterConnection):
                 password=self.access_code,
             ) as client:
                 self._mqtt_client = client
-                await client.subscribe("elegoo/+/+/register_response")
                 self.camera_url = f"http://{self.ip}:8080/mjpeg"
 
                 if self._mqtt_serial:
                     # Fast path: serial known from cache — subscribe only to what we need
                     sn = self._mqtt_serial
                     await client.subscribe(f"elegoo/{sn}/api_status")
+                    await client.subscribe(
+                        f"elegoo/{sn}/{self._mqtt_client_id}/register_response"
+                    )
                     await client.subscribe(f"elegoo/{sn}/{self._mqtt_client_id}/api_response")
                     await client.publish(
                         f"elegoo/{sn}/api_register",
@@ -196,10 +204,16 @@ class CC2Connection(PrinterConnection):
     async def _handle_mqtt_message(self, message) -> None:
         topic = str(message.topic)
 
-        if "register_response" in topic:
+        expected_register_topic = (
+            f"elegoo/{self._mqtt_serial}/{self._mqtt_client_id}/register_response"
+            if self._mqtt_serial and self._mqtt_client_id else ""
+        )
+        if topic == expected_register_topic:
             try:
                 p = json.loads(message.payload.decode())
                 if p.get("error") == "ok":
+                    if self._mqtt_registered:
+                        return
                     self._mqtt_registered = True
                     self.connected = True
                     print(f"[Printer {self.name}] CC2 registered OK — ready")
@@ -264,26 +278,37 @@ class CC2Connection(PrinterConnection):
             # Thumbnail response (method 1045)
             if _method == 1045 and isinstance(inner, dict):
                 if self._pending_thumb_fut and not self._pending_thumb_fut.done():
-                    b64 = inner.get("thumbnail") or inner.get("data") or inner.get("image")
-                    self._pending_thumb_fut.set_result(b64 if isinstance(b64, str) else None)
+                    response_filename = str(inner.get("filename") or "")
+                    if (not response_filename or self._same_filename(
+                            response_filename, self._pending_thumb_filename)):
+                        b64 = inner.get("thumbnail") or inner.get("data") or inner.get("image")
+                        self._pending_thumb_fut.set_result(b64 if isinstance(b64, str) else None)
                 return
 
             # File metadata response (method 1046)
             if _method == 1046 and isinstance(inner, dict):
-                if self._pending_meta_fut and not self._pending_meta_fut.done():
+                response_filename = str(inner.get("filename") or "")
+                if (self._pending_meta_fut and not self._pending_meta_fut.done()
+                        and self._same_filename(
+                            response_filename, self._pending_meta_filename)):
                     self._pending_meta_fut.set_result(inner)
-                # Always store expected filament + duration for live tracking
-                fila_g = inner.get("total_filament_used")
-                if fila_g is not None and float(fila_g or 0) > 0:
-                    self._expected_filament_g = float(fila_g)
-                pt = inner.get("print_time")
-                if pt is not None and int(pt or 0) > 0:
-                    self._expected_print_time_s = int(pt)
-                if self._expected_filament_g or self._expected_print_time_s:
-                    print(f"[Printer {self.name}] File metadata: "
-                          f"{self._expected_filament_g}g / {self._expected_print_time_s}s")
                 print(f"[Printer {self.name}] 1046 full response: {json.dumps(inner)[:600]}")
-                asyncio.create_task(self._auto_link_spools_from_metadata(inner))
+                if self._same_filename(response_filename, self._current_filename):
+                    # Only metadata for the current job can influence its
+                    # progress, spool selection, and deduction.
+                    self._current_print_metadata = inner
+                    fila_g = inner.get("total_filament_used")
+                    if fila_g is not None and float(fila_g or 0) > 0:
+                        self._expected_filament_g = float(fila_g)
+                    pt = inner.get("print_time")
+                    if pt is not None and int(pt or 0) > 0:
+                        self._expected_print_time_s = int(pt)
+                    if self._expected_filament_g or self._expected_print_time_s:
+                        print(f"[Printer {self.name}] File metadata: "
+                              f"{self._expected_filament_g}g / {self._expected_print_time_s}s")
+                    if self._print_metadata_event:
+                        self._print_metadata_event.set()
+                    asyncio.create_task(self._auto_link_spools_from_metadata(inner))
                 return
 
             source = inner if isinstance(inner, dict) else payload
@@ -306,6 +331,10 @@ class CC2Connection(PrinterConnection):
             if updates:
                 deep_merge(self._cc2_state, updates)
                 self._apply_cc2_status()
+                # Polling replies carry the same state as api_status pushes.
+                # Account for their transitions too, otherwise an ended print
+                # can be visible in the UI but never reach history/deduction.
+                await self._check_print_transition()
                 await self._broadcast_state()
             return
 
@@ -321,6 +350,9 @@ class CC2Connection(PrinterConnection):
                     # Switch from wildcard to specific subscriptions
                     await self._mqtt_client.unsubscribe("elegoo/#")
                     await self._mqtt_client.subscribe(f"elegoo/{sn}/api_status")
+                    await self._mqtt_client.subscribe(
+                        f"elegoo/{sn}/{self._mqtt_client_id}/register_response"
+                    )
                     await self._mqtt_client.subscribe(
                         f"elegoo/{sn}/{self._mqtt_client_id}/api_response"
                     )
@@ -367,22 +399,29 @@ class CC2Connection(PrinterConnection):
         """Fetch thumbnail (1045) + metadata (1046) via MQTT and broadcast file_info."""
         if not self._mqtt_registered:
             return
-        loop = asyncio.get_running_loop()
-        self._pending_thumb_fut = loop.create_future()
-        self._pending_meta_fut  = loop.create_future()
-        await self.send_cmd(1045, {"storage_media": "local", "filename": filename})
-        await self.send_cmd(1046, {"storage_media": "local", "filename": filename})
-        try:
-            results = await asyncio.wait_for(
-                asyncio.gather(self._pending_thumb_fut, self._pending_meta_fut,
-                               return_exceptions=True),
-                timeout=10,
-            )
-        except asyncio.TimeoutError:
-            results = [None, {}]
-        finally:
-            self._pending_thumb_fut = None
-            self._pending_meta_fut  = None
+        # MQTT responses do not expose a request id reliably, so do not allow
+        # two browser lookups to overwrite each other's single response futures.
+        async with self._file_info_lock:
+            loop = asyncio.get_running_loop()
+            self._pending_thumb_fut = loop.create_future()
+            self._pending_meta_fut  = loop.create_future()
+            self._pending_thumb_filename = filename
+            self._pending_meta_filename = filename
+            await self.send_cmd(1045, {"storage_media": "local", "filename": filename})
+            await self.send_cmd(1046, {"storage_media": "local", "filename": filename})
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(self._pending_thumb_fut, self._pending_meta_fut,
+                                   return_exceptions=True),
+                    timeout=10,
+                )
+            except asyncio.TimeoutError:
+                results = [None, {}]
+            finally:
+                self._pending_thumb_fut = None
+                self._pending_meta_fut  = None
+                self._pending_thumb_filename = ""
+                self._pending_meta_filename = ""
 
         thumb_b64 = results[0] if isinstance(results[0], str) else None
         meta      = results[1] if isinstance(results[1], dict) else {}
@@ -410,6 +449,67 @@ class CC2Connection(PrinterConnection):
                 "type": "file_list", "printer_id": self.id, "files": [],
                 "error": "File list request timed out.",
             })
+
+    @staticmethod
+    def _same_filename(left: str, right: str) -> bool:
+        """Compare printer paths without treating an empty response as a match."""
+        return bool(left and right and Path(left).name == Path(right).name)
+
+    def _begin_print_tracking(self, filename: str, *, force: bool = False) -> None:
+        """Reset one CC2 job and fetch its 1046 metadata with bounded retries."""
+        if not filename:
+            return
+        same_job = self._same_filename(filename, self._tracked_print_filename)
+        fetch_in_progress = (
+            self._print_metadata_task is not None
+            and not self._print_metadata_task.done()
+        )
+        if not force and same_job and (fetch_in_progress or self._current_print_metadata):
+            return
+        if self._print_metadata_task and not self._print_metadata_task.done():
+            self._print_metadata_task.cancel()
+        self._tracked_print_filename = filename
+        self._current_print_metadata = None
+        self._filament_mm_max = 0.0
+        self._extruder_offset = 0.0
+        self._last_extruder = 0.0
+        self._expected_filament_g = 0.0
+        self._expected_print_time_s = 0
+        self._last_active_filament_mm = 0.0
+        self._print_metadata_task = asyncio.create_task(
+            self._fetch_print_metadata(filename)
+        )
+
+    async def _fetch_print_metadata(self, filename: str) -> None:
+        """Request 1046 until it arrives, the job changes, or retries are exhausted."""
+        event: asyncio.Event | None = None
+        try:
+            for attempt in range(1, 4):
+                if not self._same_filename(filename, self._current_filename):
+                    return
+                event = asyncio.Event()
+                self._print_metadata_event = event
+                sent = await self.send_cmd(
+                    1046, {"storage_media": "local", "filename": filename}
+                )
+                if sent:
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=4)
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                if attempt < 3:
+                    await asyncio.sleep(2)
+            print(f"[Printer {self.name}] 1046 unavailable for {filename!r} after 3 attempts")
+        finally:
+            if self._print_metadata_event is event:
+                self._print_metadata_event = None
+
+    def _start_auto_link_for_current_metadata(self) -> None:
+        if self._current_print_metadata:
+            asyncio.create_task(
+                self._auto_link_spools_from_metadata(self._current_print_metadata)
+            )
 
     async def _auto_link_spools_from_metadata(self, meta: dict) -> None:
         """Link CC2 trays to exact material/color matches in Spoolman."""
@@ -533,7 +633,7 @@ class CC2Connection(PrinterConnection):
     async def start_print_file(self, filename: str, print_opts: dict | None = None) -> bool:
         self._current_filename = filename
         opts = print_opts or {}
-        return await self.send_cmd(1020, {
+        ok = await self.send_cmd(1020, {
             "filename":      filename,
             "storage_media": "local",
             "config": {
@@ -542,6 +642,11 @@ class CC2Connection(PrinterConnection):
                 "print_layout":  "B" if opts.get("smooth_plate") else "A",
             },
         })
+        if ok:
+            # Do not rely on a subsequent state push: some firmware revisions
+            # report only a sub_status while starting a job.
+            self._begin_print_tracking(filename, force=True)
+        return ok
 
     def _apply_cc2_status(self) -> None:
         s     = self._cc2_state
@@ -594,38 +699,42 @@ class CC2Connection(PrinterConnection):
             remaining      = 0
 
         # CC2 doesn't report remaining_time_sec — estimate from file's expected duration
-        if remaining == 0 and state_str == "printing" and self._expected_print_time_s > 0:
+        if remaining == 0 and status_code == 3 and self._expected_print_time_s > 0:
             remaining = max(0, self._expected_print_time_s - print_duration)
 
         total    = print_duration + remaining
         progress = min(100, round(print_duration / total * 100)) if total > 0 else 0
 
+        # Some firmware versions omit print_status.state and expose the active
+        # phase only through sub_status.  Keep a normalized state edge for
+        # metadata fetching and per-print cleanup in that case.
+        tracking_state = state_str
+        if not tracking_state:
+            if status_code == 3:
+                tracking_state = "printing"
+            elif status_code == 9:
+                tracking_state = "complete"
+            elif status_code == 8:
+                tracking_state = "cancelled"
+            elif status_code == 14:
+                tracking_state = "error"
+            elif status_code == 0 and self._prev_state_str in ("printing", "paused"):
+                tracking_state = "standby"
+
         prev_state_str = self._prev_state_str
         print_ending = (
-            state_str in ("complete", "standby", "cancelled", "error")
+            tracking_state in ("complete", "standby", "cancelled", "error")
             and prev_state_str in ("printing", "paused")
         )
         new_print = (
-            state_str == "printing"
+            tracking_state == "printing"
             and prev_state_str not in ("printing", "paused")
         )
         if new_print:
-            self._filament_mm_max        = 0.0
-            self._extruder_offset        = 0.0
-            self._last_extruder          = 0.0
-            self._expected_filament_g    = 0.0
-            self._expected_print_time_s  = 0
-            self._last_active_filament_mm = 0.0
             fname = self._current_filename
             if fname:
-                self._meta_fetch_filename = fname
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(
-                        self.send_cmd(1046, {"storage_media": "local", "filename": fname})
-                    )
-                except RuntimeError:
-                    pass
+                self._begin_print_tracking(fname)
+                self._start_auto_link_for_current_metadata()
 
         # CC2 MQTT never sends filament_used or reliable gcode_move.extruder.
         # Use time-progress × expected grams (from method 1046) instead.
@@ -633,10 +742,10 @@ class CC2Connection(PrinterConnection):
             density = self.filament_density or 1.24
             expected_mm = self._expected_filament_g * 10.0 / (math.pi * 0.0875 ** 2 * density)
             just_finished = (
-                state_str in ("complete", "standby")
+                tracking_state in ("complete", "standby")
                 and prev_state_str in ("printing", "paused")
             )
-            if state_str == "printing" and (print_duration + remaining) > 0:
+            if tracking_state == "printing" and (print_duration + remaining) > 0:
                 filament_mm = print_duration / (print_duration + remaining) * expected_mm
                 self._last_active_filament_mm = filament_mm
             elif just_finished:
@@ -667,8 +776,13 @@ class CC2Connection(PrinterConnection):
                     f"Slot 1 → {slot_one_spool}"
                 )
 
-        if state_str:
-            self._prev_state_str = state_str
+        if print_ending:
+            self._tracked_print_filename = ""
+            if self._print_metadata_task and not self._print_metadata_task.done():
+                self._print_metadata_task.cancel()
+
+        if tracking_state:
+            self._prev_state_str = tracking_state
 
         led    = s.get("led", {})
         led_on = 1 if (led.get("status", 0) or 0) > 0 else 0

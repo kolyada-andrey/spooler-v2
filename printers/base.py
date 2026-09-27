@@ -219,7 +219,10 @@ class PrinterConnection:
         pi = self._decoded_printinfo()
         cur_status = pi.get("Status")
 
-        ACTIVE   = {1, 2, 3, 4, 7, 9, 10, 12, 13, 15, 16, 18, 19, 20, 21}
+        # Terminal states must not be considered active.  In particular, keeping
+        # 9 (completed) here prevents the following 9 -> printing transition
+        # from resetting the per-print extrusion snapshot.
+        ACTIVE   = {1, 2, 3, 4, 7, 10, 12, 13, 15, 16, 18, 19, 20, 21}
         PRINTING = {2, 3, 4, 13}
 
         if cur_status in ACTIVE and self._last_print_status not in ACTIVE:
