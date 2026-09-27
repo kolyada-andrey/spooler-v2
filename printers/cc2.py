@@ -127,7 +127,7 @@ class CC2Connection(PrinterConnection):
                     sn = self._mqtt_serial
                     await client.subscribe(f"elegoo/{sn}/api_status")
                     await client.subscribe(
-                        f"elegoo/{sn}/{self._mqtt_client_id}/register_response"
+                        f"elegoo/{sn}/{self._mqtt_request_id}/register_response"
                     )
                     await client.subscribe(f"elegoo/{sn}/{self._mqtt_client_id}/api_response")
                     await client.publish(
@@ -205,8 +205,8 @@ class CC2Connection(PrinterConnection):
         topic = str(message.topic)
 
         expected_register_topic = (
-            f"elegoo/{self._mqtt_serial}/{self._mqtt_client_id}/register_response"
-            if self._mqtt_serial and self._mqtt_client_id else ""
+            f"elegoo/{self._mqtt_serial}/{self._mqtt_request_id}/register_response"
+            if self._mqtt_serial and self._mqtt_request_id else ""
         )
         if topic == expected_register_topic:
             try:
@@ -351,7 +351,7 @@ class CC2Connection(PrinterConnection):
                     await self._mqtt_client.unsubscribe("elegoo/#")
                     await self._mqtt_client.subscribe(f"elegoo/{sn}/api_status")
                     await self._mqtt_client.subscribe(
-                        f"elegoo/{sn}/{self._mqtt_client_id}/register_response"
+                        f"elegoo/{sn}/{self._mqtt_request_id}/register_response"
                     )
                     await self._mqtt_client.subscribe(
                         f"elegoo/{sn}/{self._mqtt_client_id}/api_response"
