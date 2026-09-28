@@ -130,13 +130,7 @@ class CC2Connection(PrinterConnection):
                         f"elegoo/{sn}/{self._mqtt_request_id}/register_response"
                     )
                     await client.subscribe(f"elegoo/{sn}/{self._mqtt_client_id}/api_response")
-                    await client.publish(
-                        f"elegoo/{sn}/api_register",
-                        json.dumps({
-                            "client_id":  self._mqtt_client_id,
-                            "request_id": self._mqtt_request_id,
-                        }),
-                    )
+                    await self._send_registration()
                     print(f"[Printer {self.name}] MQTT open — registration sent (cached SN {sn})")
                 else:
                     # Cold start: subscribe to everything so the VERY FIRST message from
@@ -191,15 +185,40 @@ class CC2Connection(PrinterConnection):
             print(f"[Printer {self.name}] MQTT send error: {e}")
             return False
 
+    async def _send_registration(self) -> bool:
+        """Publish the CC2 registration handshake for the current MQTT session."""
+        if (
+            not self._mqtt_client
+            or not self._mqtt_serial
+            or not self._mqtt_client_id
+            or not self._mqtt_request_id
+        ):
+            return False
+        try:
+            await self._mqtt_client.publish(
+                f"elegoo/{self._mqtt_serial}/api_register",
+                json.dumps({
+                    "client_id": self._mqtt_client_id,
+                    "request_id": self._mqtt_request_id,
+                }),
+            )
+            return True
+        except Exception as e:
+            print(f"[Printer {self.name}] MQTT registration send error: {e}")
+            return False
+
     async def _mqtt_status_poller(self) -> None:
         tick = 0
         while True:
             await asyncio.sleep(5)
-            if self._mqtt_registered:
-                await self.send_cmd(1003)   # machine_status
-                if tick % 2 == 0:
-                    await self.send_cmd(2005)  # canvas channel info
-                tick += 1
+            if not self._mqtt_registered:
+                if await self._send_registration():
+                    print(f"[Printer {self.name}] CC2 registration retry sent")
+                continue
+            await self.send_cmd(1003)   # machine_status
+            if tick % 2 == 0:
+                await self.send_cmd(2005)  # canvas channel info
+            tick += 1
 
     async def _handle_mqtt_message(self, message) -> None:
         topic = str(message.topic)
@@ -223,6 +242,13 @@ class CC2Connection(PrinterConnection):
                     await self.send_cmd(1042)  # camera URL
                     await self.send_cmd(2005)  # canvas channel info
                     await self.send_cmd(1056)  # extruder filament info
+                    if self._current_filename and self._print_is_active():
+                        # Status pushes may arrive before the printer is ready
+                        # to acknowledge registration. Restart the metadata
+                        # lookup now that authenticated commands can succeed.
+                        self._begin_print_tracking(
+                            self._current_filename, force=True
+                        )
                     loop = asyncio.get_running_loop()
                     loop.run_in_executor(None, self._sync_spoolman_locations)
                 else:
@@ -356,13 +382,7 @@ class CC2Connection(PrinterConnection):
                     await self._mqtt_client.subscribe(
                         f"elegoo/{sn}/{self._mqtt_client_id}/api_response"
                     )
-                    await self._mqtt_client.publish(
-                        f"elegoo/{sn}/api_register",
-                        json.dumps({
-                            "client_id":  self._mqtt_client_id,
-                            "request_id": self._mqtt_request_id,
-                        }),
-                    )
+                    await self._send_registration()
                     print(f"[Printer {self.name}] CC2 registration sent")
 
         result = payload.get("result", {})
@@ -455,6 +475,15 @@ class CC2Connection(PrinterConnection):
         """Compare printer paths without treating an empty response as a match."""
         return bool(left and right and Path(left).name == Path(right).name)
 
+    def _print_is_active(self) -> bool:
+        """Return whether either raw or normalized CC2 state shows an active job."""
+        print_state = self._cc2_state.get("print_status", {}).get("state", "")
+        normalized_status = self._decoded_printinfo().get("Status")
+        return (
+            print_state in ("printing", "paused")
+            or normalized_status in (2, 3, 4, 5, 6, 7, 13)
+        )
+
     def _begin_print_tracking(self, filename: str, *, force: bool = False) -> None:
         """Reset one CC2 job and fetch its 1046 metadata with bounded retries."""
         if not filename:
@@ -500,7 +529,8 @@ class CC2Connection(PrinterConnection):
                         pass
                 if attempt < 3:
                     await asyncio.sleep(2)
-            print(f"[Printer {self.name}] 1046 unavailable for {filename!r} after 3 attempts")
+            if self._mqtt_registered:
+                print(f"[Printer {self.name}] 1046 unavailable for {filename!r} after 3 attempts")
         finally:
             if self._print_metadata_event is event:
                 self._print_metadata_event = None
@@ -534,15 +564,10 @@ class CC2Connection(PrinterConnection):
         if not color_map:
             return
 
-        print_state = self._cc2_state.get("print_status", {}).get("state", "")
-        normalized_status = self._decoded_printinfo().get("Status")
         # Newer firmware may omit print_status.state and expose the active
         # phase only through machine_status.sub_status.  _apply_cc2_status()
         # has already normalized that value into PrintInfo.Status.
-        if (
-            print_state not in ("printing", "paused")
-            and normalized_status not in (2, 3, 4, 5, 6, 7, 13)
-        ):
+        if not self._print_is_active():
             return
 
         if (
