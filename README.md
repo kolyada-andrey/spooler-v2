@@ -191,6 +191,19 @@ See [CC2_INTEGRATION.md](CC2_INTEGRATION.md) for full CC2 protocol notes.
 | 3000 | UDP – printer discovery broadcast |
 | 1883 | MQTT – CC2 printer broker (on the printer, not the server) |
 
+## Development
+
+Run the test suite locally:
+
+```
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests run offline against fixtures — no real printer or Spoolman instance needed. CI runs the same suite on every pull request and on pushes to `dev`/`main`; the Docker image is only built and published once tests pass.
+
+`GET /api/health` reports version, uptime, and per-printer connection status (name/type/connected, no IPs or access codes). No login required — it's what the Docker `HEALTHCHECK` and any external uptime monitoring hit.
+
 ## Stack
 
 - **Backend** – Python 3.12, `asyncio`, `websockets`, `aiomqtt`, `bcrypt`

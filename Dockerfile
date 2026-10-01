@@ -17,4 +17,8 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080 8443 8765 8766
 
+# No curl/wget in python:slim — use urllib so the check needs no extra package.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python3 -c "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('HTTP_PORT', '8080') + '/api/health', timeout=3)" || exit 1
+
 CMD ["python3", "server.py"]

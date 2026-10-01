@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 import state
+from persistence import dump_raw_message
 from printers.base import PrinterConnection
 from spoolman import spoolman_assign, spoolman_set_location
 from printers.protocol import (
@@ -188,6 +189,7 @@ class CC2Connection(PrinterConnection):
 
     async def _handle_mqtt_message(self, message) -> None:
         topic = str(message.topic)
+        dump_raw_message(self.id, f"cc2_mqtt:{topic}", message.payload)
 
         if "register_response" in topic:
             try:
@@ -298,6 +300,11 @@ class CC2Connection(PrinterConnection):
             if updates:
                 deep_merge(self._cc2_state, updates)
                 self._apply_cc2_status()
+                # This is the 5s status poller's method 1003 response, not the
+                # printer's unsolicited api_status push handled below — it still
+                # carries fresh print_status, so transitions must be checked
+                # here too or a print start/end seen only via polling is missed.
+                await self._check_print_transition()
                 await self._broadcast_state()
             return
 

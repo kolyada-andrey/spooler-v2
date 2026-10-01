@@ -40,6 +40,17 @@ KEY_FILE  = DATA_DIR / "key.pem"
 
 MAX_BODY = 100 * 1024 * 1024  # 100 MB
 
+CHANGELOG_FILE = Path(__file__).parent / "public" / "changelog.json"
+
+
+def _current_version() -> str:
+    """Same source the frontend's version badge reads: changelog.json's first entry."""
+    try:
+        entries = json.loads(CHANGELOG_FILE.read_text())
+        return entries[0]["version"]
+    except Exception:
+        return "unknown"
+
 # When true, Spoolman's web UI is proxied through /spoolman/ on this server.
 # When false (default), /spoolman redirects the browser directly to SPOOLMAN_URL.
 PROXY_SPOOLMAN = os.getenv("PROXY_SPOOLMAN", "true").lower() in ("1", "true", "yes")
@@ -521,6 +532,27 @@ class SPHandler(SimpleHTTPRequestHandler):
             if _auth_ok(self):
                 resp["spoolman_url"] = "/spoolman/" if PROXY_SPOOLMAN else get_spoolman_url() + "/"
             self._json(resp)
+            return
+
+        if self.path == "/api/health":
+            # No auth required — this is what Docker's HEALTHCHECK and external
+            # monitoring hit, which won't carry a session cookie. Only reports
+            # connection liveness, nothing sensitive (no IPs, no access codes).
+            import time as _time
+            self._json({
+                "status":   "ok",
+                "version":  _current_version(),
+                "uptime_s": round(_time.time() - state.START_TIME),
+                "printers": [
+                    {
+                        "id":        p.id,
+                        "name":      p.name,
+                        "type":      p.printer_type,
+                        "connected": p.connected,
+                    }
+                    for p in state.printers.values()
+                ],
+            })
             return
 
         if self.path == "/api/push-public-key":

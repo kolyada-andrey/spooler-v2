@@ -15,6 +15,39 @@ from printers.protocol import decode_printinfo
 from push import load_notif_settings, send_push_all
 from spoolman import get_spool_density, spoolman_deduct, spoolman_deduct_spool
 
+# Raw SDCP-style status codes. Shared by the pure transition classifier below
+# and (for PRINTING) by _check_notifications's "was it actively printing"
+# checks elsewhere in this file.
+#
+# 9 (complete) must stay out of ACTIVE: it's a terminal state, and keeping it
+# active would make a direct 9 -> printing transition (reprinting without an
+# intervening idle poll) look like "already active", so the per-print
+# extrusion snapshot reset in _check_print_transition would never fire.
+ACTIVE_STATUSES   = {1, 2, 3, 4, 7, 10, 12, 13, 15, 16, 18, 19, 20, 21}
+PRINTING_STATUSES = {2, 3, 4, 13}
+_END_STATUSES     = {9, 8, 14, 0}
+
+
+def classify_print_transition(prev_status, cur_status) -> str | None:
+    """Pure state-machine step: given the previous and current raw status
+    code, return which transition (if any) just happened.
+
+    Returns "start" when printing begins, "end" when a print finishes
+    (completed or cancelled/errored), otherwise None. Has no side effects and
+    touches no printer/network/disk state, so it's testable on its own —
+    the bookkeeping that reacts to each event (resetting per-print extrusion
+    tracking, writing a history entry) stays in _check_print_transition.
+
+    ACTIVE and _END_STATUSES are disjoint by construction (0/8/9/14 never
+    appear in ACTIVE_STATUSES), so "start" and "end" can never both apply to
+    the same transition.
+    """
+    if cur_status in ACTIVE_STATUSES and prev_status not in ACTIVE_STATUSES:
+        return "start"
+    if cur_status in _END_STATUSES and prev_status in PRINTING_STATUSES | {5, 6}:
+        return "end"
+    return None
+
 
 class PrinterConnection:
     def __init__(
@@ -218,11 +251,9 @@ class PrinterConnection:
     async def _check_print_transition(self) -> None:
         pi = self._decoded_printinfo()
         cur_status = pi.get("Status")
+        event = classify_print_transition(self._last_print_status, cur_status)
 
-        ACTIVE   = {1, 2, 3, 4, 7, 9, 10, 12, 13, 15, 16, 18, 19, 20, 21}
-        PRINTING = {2, 3, 4, 13}
-
-        if cur_status in ACTIVE and self._last_print_status not in ACTIVE:
+        if event == "start":
             self._print_start_time = time.time()
             # Initialise per-spool tracking for this print
             self._spool_extrusion = {}
@@ -234,7 +265,7 @@ class PrinterConnection:
                 if active_tray >= 0 else None
             )
 
-        if cur_status in (9, 8, 14, 0) and self._last_print_status in PRINTING | {5, 6}:
+        if event == "end":
             filament_mm = pi.get("TotalExtrusion", 0) or 0
             filename    = pi.get("Filename", "")
             print_time  = pi.get("PrintTime", 0) or 0
