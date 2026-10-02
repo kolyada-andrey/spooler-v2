@@ -27,6 +27,8 @@ from auth import (
 from backup import (
     BACKUP_DIR, RestoreError, create_backup_zip, list_auto_backups, restore_from_zip,
 )
+from features import describe_all as describe_all_features, is_enabled, requires_feature, set_enabled
+from features import FeatureError
 from persistence import DATA_DIR, current_version, load_history, save_printers
 from push import (
     WEBPUSH_AVAILABLE, add_subscription, get_public_key, has_subscriptions,
@@ -227,6 +229,7 @@ class SPHandler(SimpleHTTPRequestHandler):
 
     # ── Camera proxy ──────────────────────────────────────────────────────────
 
+    @requires_feature("camera")
     def _proxy_camera(self):
         printer_id = urllib.parse.unquote(self.path[len("/api/camera/"):].split("?")[0])
         p = state.printers.get(printer_id)
@@ -275,6 +278,7 @@ class SPHandler(SimpleHTTPRequestHandler):
     # CC1: http://{ip}:80/thumbnail/{bare_filename}  (no auth needed)
     # CC2: no accessible thumbnail endpoint — skipped client-side
 
+    @requires_feature("camera")
     def _proxy_thumbnail(self):
         rest = self.path[len("/api/thumbnail/"):]
         parts = rest.split("/", 1)
@@ -328,6 +332,7 @@ class SPHandler(SimpleHTTPRequestHandler):
 
     # ── Spoolman proxy ────────────────────────────────────────────────────────
 
+    @requires_feature("spoolman")
     def _proxy_spoolman(self, method: str, path: str, body: bytes | None):
         if not path.startswith("/api/v1/"):
             self._json({"error": "Invalid Spoolman path"}, 400)
@@ -358,6 +363,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._json({"error": f"Spoolman unreachable: {e}"}, 502)
 
+    @requires_feature("spoolman")
     def _proxy_spoolman_ui(self, method: str, sm_path: str, body: bytes | None = None):
         """Proxy Spoolman's own web UI through our server.
 
@@ -562,13 +568,18 @@ class SPHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/notification-settings":
             if not self._check_auth():
                 return
+            if not is_enabled("notifications"):
+                self._json({"error": "feature_disabled", "feature": "notifications"}, 403)
+                return
             self._json(load_notif_settings())
             return
 
         if not self._check_auth():
             return
 
-        if self.path.startswith("/api/camera/"):
+        if self.path == "/api/features":
+            self._json(describe_all_features())
+        elif self.path.startswith("/api/camera/"):
             self._proxy_camera()
         elif self.path.startswith("/api/thumbnail/"):
             self._proxy_thumbnail()
@@ -577,6 +588,9 @@ class SPHandler(SimpleHTTPRequestHandler):
         elif self.path == "/api/history":
             self._json(load_history())
         elif self.path.startswith("/api/lookup-ean"):
+            if not is_enabled("spoolman"):
+                self._json({"error": "feature_disabled", "feature": "spoolman"}, 403)
+                return
             qs     = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
             ean    = params.get("ean", [""])[0].strip()
@@ -590,6 +604,9 @@ class SPHandler(SimpleHTTPRequestHandler):
                     return
             self._json({"error": "Not found"}, 404)
         elif self.path == "/api/filament-meta":
+            if not is_enabled("spoolman"):
+                self._json({"error": "feature_disabled", "feature": "spoolman"}, 403)
+                return
             db     = get_spoolman_db()
             brands = sorted({item.get("manufacturer", "") for item in db if item.get("manufacturer")})
             mat_map: dict = {}
@@ -631,6 +648,9 @@ class SPHandler(SimpleHTTPRequestHandler):
 
     def do_PATCH(self):
         if not self._check_auth():
+            return
+        if self.path == "/api/features":
+            self._handle_patch_features()
             return
         if PROXY_SPOOLMAN and self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("PATCH", self.path, self._read_body())
@@ -698,6 +718,7 @@ class SPHandler(SimpleHTTPRequestHandler):
 
     # ── Complex POST handlers ─────────────────────────────────────────────────
 
+    @requires_feature("notify_webpush")
     def _handle_push_subscribe(self):
         try:
             sub = json.loads(self._read_body() or b"{}")
@@ -711,6 +732,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         add_subscription(sub)
         self._json({"ok": True})
 
+    @requires_feature("notify_webpush")
     def _handle_push_unsubscribe(self):
         try:
             body = json.loads(self._read_body() or b"{}")
@@ -720,6 +742,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         remove_subscription(body.get("endpoint", ""))
         self._json({"ok": True})
 
+    @requires_feature("notifications")
     def _handle_notif_settings(self):
         try:
             s = json.loads(self._read_body() or b"{}")
@@ -729,6 +752,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         save_notif_settings(s)
         self._json({"ok": True})
 
+    @requires_feature("notify_webpush")
     def _handle_push_test(self):
         self._read_body()
         if not WEBPUSH_AVAILABLE:
@@ -740,6 +764,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         send_push_all("Spooler — Test notification", "Push notifications are working!")
         self._json({"ok": True})
 
+    @requires_feature("spoolman")
     def _handle_import_filaments(self):
         try:
             req_body = json.loads(self._read_body() or b"{}")
@@ -919,6 +944,35 @@ class SPHandler(SimpleHTTPRequestHandler):
         # restart: unless-stopped brings the container back automatically;
         # outside Docker the process needs restarting by hand.
         threading.Timer(1.0, lambda: os._exit(0)).start()
+
+    # ── Feature flags ─────────────────────────────────────────────────────────
+
+    def _handle_patch_features(self):
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except Exception:
+            self._json({"error": "Bad request"}, 400)
+            return
+        key = body.get("key")
+        enabled = body.get("enabled")
+        if not isinstance(key, str) or not isinstance(enabled, bool):
+            self._json({"error": "Expected {\"key\": str, \"enabled\": bool}"}, 400)
+            return
+        try:
+            cascaded = set_enabled(key, enabled)
+        except FeatureError as e:
+            self._json({"error": str(e)}, 400)
+            return
+        features = describe_all_features()
+        self._json({"ok": True, "features": features, "cascaded": cascaded})
+        # Broadcasting runs on the asyncio loop, this handler runs on its own
+        # HTTP request thread -- _ws_loop is the same loop reference the combo
+        # WebSocket adopter below already uses to bridge threads safely.
+        if _ws_loop is not None:
+            asyncio.run_coroutine_threadsafe(
+                state.broadcast_to_browsers({"type": "features_changed", "features": features}),
+                _ws_loop,
+            )
 
     # ── Response helper ───────────────────────────────────────────────────────
 

@@ -17,6 +17,7 @@ try:
 except ImportError:
     WEBPUSH_AVAILABLE = False
 
+from features import is_enabled
 from persistence import DATA_DIR
 
 VAPID_FILE          = DATA_DIR / "vapid_keys.json"
@@ -97,7 +98,7 @@ def save_notif_settings(s: dict) -> None:
 
 
 def send_push_all(title: str, body: str) -> None:
-    if not WEBPUSH_AVAILABLE or _vapid is None or not _push_subs:
+    if not is_enabled("notify_webpush") or not WEBPUSH_AVAILABLE or _vapid is None or not _push_subs:
         return
     dead = []
     for sub in list(_push_subs):

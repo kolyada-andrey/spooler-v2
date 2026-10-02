@@ -1337,6 +1337,22 @@ main {
 .backup-auto-row:last-child { border-bottom: none; }
 .backup-auto-empty { font-size: 12px; color: var(--text-muted); }
 
+/* ─── Feature flags ───────────────────────────────────────────────────────── */
+.features-list { display: flex; flex-direction: column; gap: 4px; }
+.feature-group-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--text-muted); margin: 16px 0 4px;
+}
+.feature-group-title:first-child { margin-top: 0; }
+.feature-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 0; border-bottom: 1px solid var(--border);
+}
+.feature-info { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.feature-label { font-size: 13px; font-weight: 500; color: var(--text); }
+.feature-desc  { font-size: 11px; color: var(--text-muted); }
+.feature-locked-note { font-size: 11px; color: var(--yellow); }
+
 /* ─── Notification settings ───────────────────────────────────────────────── */
 .notif-list { display: flex; flex-direction: column; gap: 0; margin: 16px 0 24px; }
 .notif-row {

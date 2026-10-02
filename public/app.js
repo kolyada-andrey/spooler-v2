@@ -50,6 +50,13 @@ let history  = []; // print history log
 let spools   = []; // spool inventory from Spoolman
 let trayMap  = {}; // printer_id → { tray_id_str → spoolman_spool_id }
 let _prevActiveTray = {}; // printer_id → last seen active_tray_id
+let features = {}; // key → {name, description, enabled, locked, missing, risky, requires}
+
+function featureEnabled(key) {
+  // Unknown/not-yet-loaded features default to on so the UI doesn't flash
+  // hidden-then-shown while /api/features is still loading on first paint.
+  return features[key] ? features[key].enabled : true;
+}
 
 // ─── Spoolman field helpers ────────────────────────────────────────────────────
 function spoolName(s)       { return [s.filament?.vendor?.name, s.filament?.material, s.filament?.name].filter(Boolean).join(" ") || `Spool ${s.id}`; }
@@ -245,6 +252,9 @@ function handleMessage(msg) {
           inputAccessCode.focus();
         }, 12000);
       }
+      break;
+    case "features_changed":
+      _applyFeatures(msg.features || []);
       break;
   }
 }
@@ -450,7 +460,7 @@ function renderPrinter(printer) {
   const filamentG  = printer.filament_g  ?? 0;
   const lightOn    = getLightOn(printer);
 
-  const cameraUrl = printer.connected && printer.camera_url
+  const cameraUrl = printer.connected && printer.camera_url && featureEnabled("camera")
     ? `/api/camera/${encodeURIComponent(printer.id)}`
     : null;
 
@@ -784,8 +794,9 @@ const _settingsNotifPage      = document.getElementById("settings-notifications"
 const _settingsPrintersPage   = document.getElementById("settings-printers");
 const _settingsPrinterEditPage = document.getElementById("settings-printer-edit");
 const _settingsBackupPage     = document.getElementById("settings-backup");
+const _settingsFeaturesPage   = document.getElementById("settings-features");
 
-const _allSettingsPages = () => [_settingsPwPage, _settingsNotifPage, _settingsPrintersPage, _settingsPrinterEditPage, _settingsBackupPage];
+const _allSettingsPages = () => [_settingsPwPage, _settingsNotifPage, _settingsPrintersPage, _settingsPrinterEditPage, _settingsBackupPage, _settingsFeaturesPage];
 
 function _openSettings() {
   _allSettingsPages().forEach(p => p && (p.style.display = "none"));
@@ -1086,6 +1097,12 @@ document.getElementById("btn-settings-goto-backup")?.addEventListener("click", (
   _renderAutoBackupList();
 });
 document.getElementById("btn-settings-back-backup")?.addEventListener("click", _backToSettingsMenu);
+
+document.getElementById("btn-settings-goto-features")?.addEventListener("click", () => {
+  _showSettingsPage(_settingsFeaturesPage);
+  _renderFeaturesList();
+});
+document.getElementById("btn-settings-back-features")?.addEventListener("click", _backToSettingsMenu);
 
 document.getElementById("btn-backup-download")?.addEventListener("click", () => {
   const includeSecrets = document.getElementById("backup-include-secrets")?.checked;
@@ -1557,6 +1574,86 @@ async function loadHistory() {
     history = (await r.json()).reverse(); // newest first
     renderHistory();
   } catch (e) { /* server may not be ready yet */ }
+}
+
+// ─── Feature flags ───────────────────────────────────────────────────────────
+async function loadFeatures() {
+  try {
+    const r = await fetch("/api/features");
+    if (r.ok) _applyFeatures(await r.json());
+  } catch (e) { /* server may not be ready yet */ }
+}
+
+function _applyFeatures(list) {
+  features = {};
+  list.forEach(f => { features[f.key] = f; });
+  Object.values(printers).forEach(renderPrinter);
+  const spoolsBtn = document.getElementById("btn-spools");
+  if (spoolsBtn) spoolsBtn.style.display = featureEnabled("spoolman") ? "" : "none";
+  if (_settingsFeaturesPage && _settingsFeaturesPage.style.display !== "none") {
+    _renderFeaturesList();
+  }
+}
+
+const _FEATURE_GROUPS = [
+  { title: "Monitoring",    keys: ["camera"] },
+  { title: "Notifications", keys: ["notifications", "notify_webpush"] },
+  { title: "Integrations",  keys: ["spoolman"] },
+];
+
+function _renderFeaturesList() {
+  const container = document.getElementById("features-list");
+  if (!container) return;
+  container.innerHTML = _FEATURE_GROUPS.map(group => {
+    const rows = group.keys.filter(k => features[k]).map(key => {
+      const f = features[key];
+      const lockedNote = f.locked
+        ? `<div class="feature-locked-note">Locked off by server configuration</div>`
+        : "";
+      return `
+        <div class="feature-row">
+          <div class="feature-info">
+            <span class="feature-label">${escHtml(f.name)}</span>
+            <span class="feature-desc">${escHtml(f.description)}</span>
+            ${lockedNote}
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" data-feature-key="${escAttr(key)}"
+                   ${f.enabled ? "checked" : ""} ${f.locked ? "disabled" : ""} />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>`;
+    }).join("");
+    return rows ? `<div class="feature-group-title">${escHtml(group.title)}</div>${rows}` : "";
+  }).join("");
+
+  container.querySelectorAll("input[data-feature-key]").forEach(input => {
+    input.addEventListener("change", async () => {
+      const key = input.dataset.featureKey;
+      const enabled = input.checked;
+      if (enabled && features[key]?.risky && !confirm(`${features[key].name} is marked risky. Enable it?`)) {
+        input.checked = false;
+        return;
+      }
+      try {
+        const r = await fetch("/api/features", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key, enabled }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          toast(data.error || "Could not update feature", true);
+          input.checked = !enabled;
+          return;
+        }
+        _applyFeatures(data.features);
+      } catch (e) {
+        toast("Could not update feature: " + e.message, true);
+        input.checked = !enabled;
+      }
+    });
+  });
 }
 
 function renderHistory() {
@@ -2239,6 +2336,7 @@ if (new URLSearchParams(location.search).get("demo") === "states") {
     })
     .catch(() => {});
   loadChangelog();
+  loadFeatures();
   connect();
   // Staleness is purely a function of wall-clock time passing, not of new
   // data arriving — a card can go stale with no new printer_update at all,

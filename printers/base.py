@@ -11,6 +11,7 @@ import time
 import uuid
 
 import state
+from features import is_enabled
 from persistence import FILAMENT_DENSITY, append_history, filament_mm_to_grams, save_printers
 from printers.protocol import decode_printinfo
 from push import load_notif_settings, send_push_all
@@ -301,6 +302,8 @@ class PrinterConnection:
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     def _check_notifications(self) -> None:
+        if not is_enabled("notifications"):
+            return
         s = load_notif_settings()
         if not s:
             return
