@@ -1788,20 +1788,33 @@ document.getElementById("btn-integrations-save")?.addEventListener("click", asyn
   }
 });
 
+// Settings menu items (and their sub-pages) that hide entirely when their
+// feature is off, instead of just rejecting on the server -- so the user
+// never sees a settings entry for something that's been switched off.
+const _GATED_SETTINGS_PAGES = [
+  { feature: "backup",        btnId: "btn-settings-goto-backup",        page: () => _settingsBackupPage },
+  { feature: "notifications", btnId: "btn-settings-goto-notifications", page: () => _settingsNotifPage },
+];
+
 function _applyFeatures(list) {
   features = {};
   list.forEach(f => { features[f.key] = f; });
   Object.values(printers).forEach(renderPrinter);
   const spoolsBtn = document.getElementById("btn-spools");
   if (spoolsBtn) spoolsBtn.style.display = featureEnabled("spoolman") ? "" : "none";
-  const backupBtn = document.getElementById("btn-settings-goto-backup");
-  if (backupBtn) backupBtn.style.display = featureEnabled("backup") ? "" : "none";
-  // If the backup settings page is open when the feature gets turned off
-  // (e.g. toggled from another tab), don't leave the user stranded on a
-  // now-hidden page.
-  if (!featureEnabled("backup") && _settingsBackupPage && _settingsBackupPage.style.display !== "none") {
-    _backToSettingsMenu();
-  }
+
+  _GATED_SETTINGS_PAGES.forEach(({ feature, btnId, page }) => {
+    const btn = document.getElementById(btnId);
+    const enabled = featureEnabled(feature);
+    if (btn) btn.style.display = enabled ? "" : "none";
+    // If that page is open when its feature gets turned off (e.g. toggled
+    // from another tab), don't leave the user stranded on a now-hidden page.
+    const pageEl = page();
+    if (!enabled && pageEl && pageEl.style.display !== "none") {
+      _backToSettingsMenu();
+    }
+  });
+
   if (_settingsFeaturesPage && _settingsFeaturesPage.style.display !== "none") {
     _renderFeaturesList();
   }
