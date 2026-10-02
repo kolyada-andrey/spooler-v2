@@ -297,6 +297,13 @@ class CC2Connection(PrinterConnection):
             # Strip stale filament_used from the 1002 full-state snapshot
             if inner is not None and isinstance(updates.get("print_status"), dict):
                 updates["print_status"].pop("filament_used", None)
+            # error_code is a scalar, not one of _CC2_STATE_KEYS's dict values,
+            # so the comprehension above skips it — capture it separately so
+            # it isn't silently dropped (previously it was excluded from the
+            # "unknown keys" debug warning above but never actually stored
+            # anywhere).
+            if "error_code" in source:
+                self._cc2_state["error_code"] = source["error_code"]
             if updates:
                 deep_merge(self._cc2_state, updates)
                 self._apply_cc2_status()
@@ -400,6 +407,21 @@ class CC2Connection(PrinterConnection):
         for spool_id in (state.tray_map.get(self.id) or {}).values():
             if spool_id is not None:
                 spoolman_set_location(spool_id, self.id)
+
+    def _protocol_reason_hint(self) -> dict | None:
+        # error_code's possible values and meanings aren't verified against
+        # real hardware yet — surface the raw code only, never guess a
+        # category or message from it.
+        error_code = self._cc2_state.get("error_code")
+        sub_status = self._cc2_state.get("machine_status", {}).get("sub_status")
+        if not error_code:
+            return None
+        return {
+            "code":     error_code,
+            "category": "unknown",
+            "message":  "",
+            "raw":      {"error_code": error_code, "sub_status": sub_status},
+        }
 
     async def _file_list_timeout(self) -> None:
         await asyncio.sleep(10)

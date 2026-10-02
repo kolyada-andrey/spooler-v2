@@ -8,6 +8,7 @@ Subclasses (CC1Connection, CC2Connection, …) must implement:
 
 import asyncio
 import time
+import uuid
 
 import state
 from persistence import FILAMENT_DENSITY, append_history, filament_mm_to_grams, save_printers
@@ -25,6 +26,7 @@ from spoolman import get_spool_density, spoolman_deduct, spoolman_deduct_spool
 # extrusion snapshot reset in _check_print_transition would never fire.
 ACTIVE_STATUSES   = {1, 2, 3, 4, 7, 10, 12, 13, 15, 16, 18, 19, 20, 21}
 PRINTING_STATUSES = {2, 3, 4, 13}
+PAUSED_STATUSES   = {5, 6}   # pausing, paused
 _END_STATUSES     = {9, 8, 14, 0}
 
 
@@ -41,12 +43,87 @@ def classify_print_transition(prev_status, cur_status) -> str | None:
     ACTIVE and _END_STATUSES are disjoint by construction (0/8/9/14 never
     appear in ACTIVE_STATUSES), so "start" and "end" can never both apply to
     the same transition.
+
+    "start" excludes resuming from a pause (prev in PAUSED_STATUSES) as well
+    as already being active — paused(6) -> printing(2) is a resume, not a new
+    print, and must not reset per-print extrusion tracking. (This was a real
+    bug: PAUSED_STATUSES was never in ACTIVE_STATUSES, so every resume used to
+    satisfy "prev not in ACTIVE" and incorrectly fire "start".)
     """
-    if cur_status in ACTIVE_STATUSES and prev_status not in ACTIVE_STATUSES:
+    if cur_status in ACTIVE_STATUSES and prev_status not in ACTIVE_STATUSES | PAUSED_STATUSES:
         return "start"
-    if cur_status in _END_STATUSES and prev_status in PRINTING_STATUSES | {5, 6}:
+    if cur_status in _END_STATUSES and prev_status in PRINTING_STATUSES | PAUSED_STATUSES:
         return "end"
     return None
+
+
+# ── Normalized display state ─────────────────────────────────────────────────
+#
+# Raw status codes (0-21) are the same numeric space across CC1/CC2/Moonraker/
+# Prusa — each protocol's own code maps its named states onto these numbers
+# (see each printer module's _STATE_MAP/_STATE_STR). This table is the single
+# place that turns a raw code into the small, stable vocabulary every consumer
+# (history, UI, future notifications) should use instead of re-interpreting
+# numbers themselves. Codes not listed here (e.g. 11, 17 — never observed,
+# never documented) deliberately fall through to "unknown" rather than being
+# guessed at.
+_DISPLAY_STATE_BY_CODE = {
+    0:  "idle",
+    1:  "preparing",   # homing
+    2:  "printing",
+    3:  "printing",
+    4:  "printing",
+    5:  "pausing",
+    6:  "paused",
+    7:  "stopping",
+    8:  "cancelled",
+    9:  "complete",
+    10: "preparing",   # checking
+    12: "printing",    # recovering (resuming after e.g. power loss)
+    13: "printing",    # printing (recovery)
+    14: "error",
+    15: "preparing",   # warming up
+    16: "preparing",   # preheating
+    18: "preparing",   # warming up
+    19: "preparing",   # warming up
+    20: "preparing",   # leveling
+    21: "preparing",   # warming up
+}
+
+_KIND_BY_DISPLAY_STATE = {
+    "pausing":   "pause",
+    "paused":    "pause",
+    "stopping":  "stop",
+    "cancelled": "stop",
+    "error":     "error",
+}
+
+_logged_unknown_display_codes: set = set()
+
+
+def classify_display_state(connected: bool, status_code, is_homing_between_prints: bool = False) -> str:
+    """Map (connected, raw status code) to one of: offline, idle, preparing,
+    printing, pausing, paused, stopping, complete, cancelled, error, unknown.
+
+    The numeric lookup is deterministic; the only side effect is a one-time
+    log line the first time an unrecognised raw code is seen, so it's never
+    silently hidden as "idle" (the previous frontend behavior for any code
+    outside its hand-maintained table).
+    """
+    if not connected:
+        return "offline"
+    if status_code is None:
+        return "idle"
+    if is_homing_between_prints and status_code == 0:
+        return "preparing"
+    state_str = _DISPLAY_STATE_BY_CODE.get(status_code)
+    if state_str is not None:
+        return state_str
+    if status_code not in _logged_unknown_display_codes:
+        _logged_unknown_display_codes.add(status_code)
+        print(f"[State] Unrecognised raw status code {status_code!r} — showing as 'unknown'. "
+              f"Please report this on GitHub (include the printer type) so it can be mapped.")
+    return "unknown"
 
 
 class PrinterConnection:
@@ -82,8 +159,35 @@ class PrinterConnection:
             "layer_fired":      False,
             "nozzle_hot_fired": False,
         }
+        self.state_reason: dict | None = None
+        self._last_spooler_cmd_at: float | None = None
+        self._current_print_pauses: list = []
 
     # ── Public interface ───────────────────────────────────────────────────────
+
+    def mark_spooler_command(self) -> None:
+        """Call whenever Spooler itself sends a pause/stop command, so a
+        pause/stop state observed shortly after can be attributed to
+        "spooler" rather than "printer" or "unknown"."""
+        self._last_spooler_cmd_at = time.time()
+
+    def _protocol_reason_hint(self) -> dict | None:
+        """Override in a subclass to surface protocol-specific reason info
+        when available (e.g. Moonraker's print_stats.message, CC2's
+        error_code). Return a dict with any of "code", "category", "message",
+        "raw" — or None if this protocol doesn't currently surface anything
+        for the printer's present state. Must never guess: only return
+        fields actually present in the payload, exactly as reported.
+        """
+        return None
+
+    def _is_homing_between_prints(self) -> bool:
+        """CC1-specific quirk: CurrentStatus[0] == 9 (machine-level "homing")
+        combined with PrintInfo.Status == 0 means idle-but-homing, not plain
+        idle. Other protocols never populate CurrentStatus, so this is a
+        harmless no-op for them."""
+        arr = self.status.get("CurrentStatus")
+        return isinstance(arr, list) and bool(arr) and arr[0] == 9
 
     def _decoded_printinfo(self) -> dict:
         """Decode PrintInfo hex keys and normalise CC1 time fields.
@@ -117,6 +221,9 @@ class PrinterConnection:
             "mainboard_id":    self.mainboard_id,
             "connected":       self.connected,
             "status":          status,
+            "state":           classify_display_state(
+                                   self.connected, pi.get("Status"), self._is_homing_between_prints()),
+            "state_reason":    self.state_reason,
             "attrs":           self.attrs,
             "camera_url":      self.camera_url,
             "filament_mm":     round(filament_mm, 1),
@@ -248,12 +355,75 @@ class PrinterConnection:
             "printer": self.to_dict(),
         })
 
+    def _finish_current_pause(self) -> None:
+        """Close out the most recent still-open pause segment (resume, or the
+        print ending while still paused)."""
+        for p in reversed(self._current_print_pauses):
+            if p["until"] is None:
+                now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
+                p["until"] = now_iso
+                try:
+                    started = time.mktime(time.strptime(p["since"], "%Y-%m-%dT%H:%M:%S"))
+                    ended   = time.mktime(time.strptime(now_iso, "%Y-%m-%dT%H:%M:%S"))
+                    p["duration_s"] = int(ended - started)
+                except Exception:
+                    p["duration_s"] = None
+                break
+
+    def _update_state_reason(self, display_state: str) -> None:
+        """Set/clear self.state_reason as the printer enters or leaves a
+        pause/stop/error state. Set once on first entry into a given kind
+        (pausing->paused keeps the same reason, doesn't reset "since"),
+        cleared only on resuming to "printing" — NOT on returning to "idle",
+        since the whole point is that the last reason stays visible until the
+        next print actually starts (see _check_print_transition's "start"
+        branch for that reset)."""
+        kind = _KIND_BY_DISPLAY_STATE.get(display_state)
+        was_pause = self.state_reason is not None and self.state_reason["kind"] == "pause"
+
+        if kind is None:
+            if display_state == "printing" and was_pause:
+                self._finish_current_pause()
+                self.state_reason = None
+            return
+
+        if self.state_reason is None or self.state_reason["kind"] != kind:
+            hint = self._protocol_reason_hint() or {}
+            if self._last_spooler_cmd_at is not None and time.time() - self._last_spooler_cmd_at <= 15:
+                initiated_by = "spooler"
+            elif hint.get("message") or hint.get("code"):
+                initiated_by = "printer"
+            else:
+                initiated_by = "unknown"
+            self.state_reason = {
+                "kind":         kind,
+                "initiated_by": initiated_by,
+                "code":         str(hint["code"]) if hint.get("code") not in (None, "") else "",
+                "category":     hint.get("category") or "unknown",
+                "message":      hint.get("message") or "",
+                "raw":          hint.get("raw") or {},
+                "since":        time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            if kind == "pause":
+                self._current_print_pauses.append({
+                    "since":        self.state_reason["since"],
+                    "until":        None,
+                    "duration_s":   None,
+                    "initiated_by": initiated_by,
+                    "category":     self.state_reason["category"],
+                })
+
     async def _check_print_transition(self) -> None:
         pi = self._decoded_printinfo()
         cur_status = pi.get("Status")
         event = classify_print_transition(self._last_print_status, cur_status)
 
+        display_state = classify_display_state(self.connected, cur_status, self._is_homing_between_prints())
+        self._update_state_reason(display_state)
+
         if event == "start":
+            self.state_reason = None
+            self._current_print_pauses = []
             self._print_start_time = time.time()
             # Initialise per-spool tracking for this print
             self._spool_extrusion = {}
@@ -270,12 +440,20 @@ class PrinterConnection:
             filename    = pi.get("Filename", "")
             print_time  = pi.get("PrintTime", 0) or 0
             completed   = cur_status == 9
+            # The print may have ended while still paused (rare — most
+            # protocols resume before stopping — but cheap to guard against
+            # leaving a pause segment with no "until").
+            if self.state_reason is not None and self.state_reason["kind"] == "pause":
+                self._finish_current_pause()
+            reason = self.state_reason  # kept as-is on the live printer; only copied into history
             if filament_mm > 0 or filename:
                 loop = asyncio.get_running_loop()
                 density    = await loop.run_in_executor(None, get_spool_density, self.id)
                 self.filament_density = density
                 filament_g = filament_mm_to_grams(filament_mm, density)
+                end_state = "complete" if completed else ("error" if cur_status == 14 else "cancelled")
                 entry = {
+                    "id":            uuid.uuid4().hex,
                     "timestamp":    time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "printer_id":   self.id,
                     "printer_name": self.name,
@@ -284,9 +462,15 @@ class PrinterConnection:
                     "filament_g":   filament_g,
                     "print_time_s": int(print_time),
                     "completed":    completed,
+                    "end_state":     end_state,
+                    "stop_reason":   reason["category"] if reason else None,
+                    "error_code":    reason["code"] if reason and reason["kind"] == "error" and reason["code"] else None,
+                    "error_message": reason["message"] if reason and reason["kind"] == "error" and reason["message"] else None,
+                    "initiated_by":  reason["initiated_by"] if reason else None,
+                    "pauses":        list(self._current_print_pauses),
                 }
                 await loop.run_in_executor(None, append_history, entry)
-                label = "Completed" if completed else "Cancelled"
+                label = {"complete": "Completed", "error": "Error"}.get(end_state, "Cancelled")
                 print(f"[History] {label}: {filename} – {filament_mm:.0f}mm / {filament_g}g"
                       f" (density {density} g/cm³)")
                 await state.broadcast_to_browsers({"type": "history_entry", "entry": entry})

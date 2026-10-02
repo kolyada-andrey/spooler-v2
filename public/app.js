@@ -239,7 +239,8 @@ const PRINT_STATUS = {
   10: "checking",
   12: "recovering",
   13: "printing",    // printing (recovery)
-  14: "cancelled",
+  14: "error",       // was incorrectly shown as "cancelled" — backend already
+                     // uses 14 for genuine errors (CC2/Moonraker/Prusa)
   15: "warming up",
   16: "warming up",  // preheating
   18: "warming up",
@@ -263,16 +264,21 @@ function getPrintStatus(printer) {
   // Special case: CurrentStatus[0] === 9 means homing (between prints)
   const machineCode = printer.status?.CurrentStatus?.[0];
   if (machineCode === 9 && code === 0) return "homing";
-  return PRINT_STATUS[code] ?? "idle";
+  // Codes with no table entry (e.g. 11, 17 — never documented) must show as
+  // "unknown", not silently collapse into "idle" as if nothing were wrong.
+  return PRINT_STATUS[code] ?? "unknown";
 }
 
 function statusClass(s) {
   if (["printing", "homing", "recovering"].includes(s))        return "printing";
   if (["warming up", "leveling", "checking"].includes(s))      return "warmingup";
   if (["pausing", "paused"].includes(s))                       return "paused";
-  if (["stopping", "cancelled"].includes(s))                   return "cancelled";
+  if (s === "stopping")                                         return "cancelled";
+  if (s === "cancelled")                                        return "cancelled";
+  if (s === "error")                                            return "error";
   if (s === "complete")                                         return "complete";
   if (s === "offline")                                          return "offline";
+  if (s === "unknown")                                          return "unknown";
   return "idle";
 }
 
@@ -295,6 +301,49 @@ function getSpoolActivePrinter(spoolId) {
 function isPaused(printer) {
   const s = getPrintStatus(printer);
   return ["paused", "pausing"].includes(s);
+}
+
+// Minimal reason box — full visual treatment (icons per category, etc.) is T3's
+// job; this just satisfies T2's "show why" requirement without guessing text
+// for anything not actually verified.
+const _REASON_KIND_LABEL = { pause: "Paused", stop: "Stopped", error: "Error" };
+const _REASON_CATEGORY_LABEL = {
+  filament_runout: "Filament runout",
+  nozzle_clog:     "Nozzle clog",
+  thermal:         "Thermal issue",
+  collision:       "Collision detected",
+  power_loss:      "Power loss",
+  door_open:       "Door open",
+  user:            "User action",
+  unknown:         "Reason not yet identified",
+};
+const _REASON_INITIATOR_LABEL = {
+  spooler: "from Spooler",
+  printer: "reported by printer",
+  unknown: "from printer screen, app, or unknown source",
+};
+
+function renderReasonBox(printer) {
+  const r = printer.state_reason;
+  if (!r) return "";
+  const kindLabel = _REASON_KIND_LABEL[r.kind] || "Notice";
+  const initiator = _REASON_INITIATOR_LABEL[r.initiated_by] || _REASON_INITIATOR_LABEL.unknown;
+  // A spooler-initiated pause/stop already has a known, obvious cause (someone
+  // clicked the button) — showing a generic "reason not yet identified" after
+  // it would be actively misleading, so only append category/message detail
+  // when there's something the printer/protocol actually reported.
+  const detail = r.initiated_by === "spooler"
+    ? (r.message || "")
+    : (r.message || _REASON_CATEGORY_LABEL[r.category] || _REASON_CATEGORY_LABEL.unknown);
+  return `
+    <div class="reason-box ${r.kind === "error" ? "reason-box-error" : ""}">
+      <div class="reason-box-main">
+        <strong>${escHtml(kindLabel)}</strong> ${escHtml(initiator)}
+        ${detail ? ` — ${escHtml(detail)}` : ""}
+      </div>
+      ${r.code ? `<div class="reason-box-code">Code: ${escHtml(String(r.code))}</div>` : ""}
+    </div>
+  `;
 }
 
 function getProgress(printer) {
@@ -394,6 +443,8 @@ function renderPrinter(printer) {
         </svg>
       </button>
     </div>
+
+    ${renderReasonBox(printer)}
 
     <!-- Camera -->
     <div class="card-camera">
@@ -1410,9 +1461,19 @@ function renderHistory() {
   tbody.innerHTML = history.map(e => {
     const date   = e.timestamp.replace("T", " ").slice(0, 16);
     const m      = (e.filament_mm / 1000).toFixed(2);
-    const result = e.completed === false
-      ? `<span style="color:var(--red);font-size:11px">cancelled</span>`
-      : `<span style="color:var(--green);font-size:11px">done</span>`;
+    // end_state/error_code/error_message/stop_reason are new fields (T2) —
+    // older history entries won't have them, so fall back to the original
+    // completed-only distinction for those.
+    let result;
+    if (e.end_state === "error") {
+      const detail = e.error_message || e.stop_reason || "";
+      result = `<span style="color:var(--red);font-size:11px"${detail ? ` title="${escAttr(detail)}"` : ""}>error${e.error_code ? ` (${escHtml(String(e.error_code))})` : ""}</span>`;
+    } else if (e.end_state === "cancelled" || (e.end_state === undefined && e.completed === false)) {
+      const detail = e.stop_reason && e.stop_reason !== "unknown" ? e.stop_reason : "";
+      result = `<span style="color:var(--red);font-size:11px"${detail ? ` title="${escAttr(detail)}"` : ""}>cancelled</span>`;
+    } else {
+      result = `<span style="color:var(--green);font-size:11px">done</span>`;
+    }
     return `<tr>
       <td class="col-date">${escHtml(date)}</td>
       <td>${escHtml(e.printer_name)}</td>

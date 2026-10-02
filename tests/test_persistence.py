@@ -47,3 +47,32 @@ def test_append_history_loses_no_entries_under_concurrent_writers():
         list(ex.map(lambda i: persistence.append_history({"i": i}), range(n)))
     history = persistence.load_history()
     assert sorted(e["i"] for e in history) == list(range(n))
+
+
+def test_migrate_history_ids_backfills_missing_ids():
+    import json
+    persistence.HISTORY_FILE.write_text(json.dumps([
+        {"filename": "old1.gcode"},
+        {"filename": "old2.gcode", "id": "already-has-one"},
+    ]))
+    persistence.migrate_history_ids()
+    history = persistence.load_history()
+    assert history[0]["id"]  # backfilled, non-empty
+    assert history[1]["id"] == "already-has-one"  # untouched
+
+
+def test_migrate_history_ids_is_a_noop_when_nothing_missing():
+    persistence.append_history({"filename": "a.gcode", "id": "existing-id"})
+    before = persistence.load_history()
+    persistence.migrate_history_ids()
+    after = persistence.load_history()
+    assert before == after
+
+
+def test_migrate_history_ids_does_not_deadlock_with_append_history():
+    # migrate_history_ids() must not be called from inside append_history's
+    # lock — this just exercises the real call sequence a server startup
+    # would use, with a timeout-free assertion that it simply returns.
+    persistence.append_history({"filename": "a.gcode"})
+    persistence.migrate_history_ids()
+    assert len(persistence.load_history()) == 1

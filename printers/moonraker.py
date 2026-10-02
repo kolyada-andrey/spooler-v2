@@ -22,7 +22,7 @@ POLL_INTERVAL = 2.0
 # Moonraker /printer/objects/query fields we need
 _QUERY_PATH = (
     "/printer/objects/query"
-    "?print_stats&display_status&extruder&heater_bed"
+    "?print_stats&display_status&extruder&heater_bed&webhooks"
 )
 
 _STATE_MAP = {
@@ -35,6 +35,26 @@ _STATE_MAP = {
 }
 
 
+def categorize_moonraker_message(message: str) -> str:
+    """Best-effort category guess from Klipper's own free-text print_stats
+    message / webhooks state_message — NOT a fixed code table. Klipper's
+    message text varies by firmware version and by the user's own macros
+    (filament-runout alerts in particular are usually raised from a
+    user-configured gcode_macro, so there's no single universal string).
+    Only matches a couple of patterns Klipper's own built-in protections are
+    known to use; anything else stays "unknown" rather than guessing. The
+    original message text is always preserved regardless of this category.
+    """
+    text = (message or "").lower()
+    if not text:
+        return "unknown"
+    if "filament" in text and ("runout" in text or "sensor" in text):
+        return "filament_runout"
+    if "heater" in text or "thermal" in text or "temperature" in text:
+        return "thermal"
+    return "unknown"
+
+
 class MoonrakerConnection(PrinterConnection):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, printer_type="moonraker", **kwargs)
@@ -42,6 +62,8 @@ class MoonrakerConnection(PrinterConnection):
         self._expected_filament_mm = 0.0
         self._expected_print_time_s = 0
         self._last_filename = ""
+        self._print_stats_message = ""
+        self._webhooks_state_message = ""
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
@@ -100,9 +122,13 @@ class MoonrakerConnection(PrinterConnection):
         ds  = status.get("display_status") or {}
         ext = status.get("extruder") or {}
         bed = status.get("heater_bed") or {}
+        wh  = status.get("webhooks") or {}
 
         raw_state   = ps.get("state") or "standby"
         status_code = _STATE_MAP.get(raw_state, 0)
+
+        self._print_stats_message    = ps.get("message") or ""
+        self._webhooks_state_message = wh.get("state_message") or ""
 
         filename       = ps.get("filename") or ""
         print_duration = float(ps.get("print_duration") or 0)
@@ -147,6 +173,19 @@ class MoonrakerConnection(PrinterConnection):
             "TempOfHotbed":     float(bed.get("temperature") or 0),
             "TempTargetHotbed": float(bed.get("target") or 0),
             "SpeedFactor":      100,
+        }
+
+    def _protocol_reason_hint(self) -> dict | None:
+        msg = self._print_stats_message or self._webhooks_state_message
+        if not msg:
+            return None
+        return {
+            "message":  msg,
+            "category": categorize_moonraker_message(msg),
+            "raw": {
+                "print_stats_message":    self._print_stats_message,
+                "webhooks_state_message": self._webhooks_state_message,
+            },
         }
 
     async def _fetch_file_metadata(self, filename: str) -> None:

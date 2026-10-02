@@ -8,6 +8,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 DATA_DIR      = Path(os.getenv("DATA_DIR", Path(__file__).parent))
@@ -133,3 +134,24 @@ def append_history(entry: dict) -> None:
         if len(history) > HISTORY_MAX_ENTRIES:
             history = history[-HISTORY_MAX_ENTRIES:]
         _atomic_write(HISTORY_FILE, json.dumps(history, indent=2))
+
+
+def migrate_history_ids() -> None:
+    """One-time startup migration: backfill a uuid4 "id" on any history entry
+    that predates it (added alongside end_state/stop_reason/etc.). Safe to
+    call on every startup — a no-op once every entry already has one.
+
+    Deliberately called outside append_history's lock (load_history() here
+    does a plain read, the write below takes _HISTORY_LOCK on its own) —
+    threading.Lock isn't reentrant, so nesting this inside an already-held
+    _HISTORY_LOCK would deadlock.
+    """
+    history = load_history()
+    changed = False
+    for entry in history:
+        if "id" not in entry:
+            entry["id"] = uuid.uuid4().hex
+            changed = True
+    if changed:
+        with _HISTORY_LOCK:
+            _atomic_write(HISTORY_FILE, json.dumps(history, indent=2))

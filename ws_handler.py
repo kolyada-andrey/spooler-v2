@@ -304,3 +304,7 @@ async def handle_browser_message(ws, raw: str) -> None:
             await ws.send(json.dumps({"type": "error", "message": "Printer not connected"}))
         elif action in ("light_on", "light_off"):
             _schedule_light_refresh(printer)
+        elif action in ("pause", "stop"):
+            # So state_reason attributes the resulting pause/stop to "spooler"
+            # rather than "printer"/"unknown" when it's observed shortly after.
+            printer.mark_spooler_command()

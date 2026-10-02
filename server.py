@@ -57,7 +57,7 @@ import auth
 import state
 from auth import AUTH_ENABLED, BCRYPT_AVAILABLE, session_cleanup_loop
 from http_handler import run_http, run_https, set_ws_adopter
-from persistence import DATA_DIR, load_printers, load_tray_map
+from persistence import DATA_DIR, load_printers, load_tray_map, migrate_history_ids
 from printers import PRINTER_TYPES, make_printer
 from push import init_vapid
 from ws_handler import browser_handler
@@ -106,6 +106,7 @@ async def main() -> None:
         print(f"[Auth] Authentication enabled (user: {auth._get_username()})")
 
     init_vapid()
+    migrate_history_ids()
 
     # Load saved printers
     for entry in load_printers():
