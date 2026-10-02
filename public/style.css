@@ -18,6 +18,18 @@
   --radius:      12px;
   --radius-sm:   8px;
   --shadow:      0 4px 24px rgba(0,0,0,.5);
+
+  /* Status indicator palette (T3) — one variable per printer.state bucket,
+     shared by both the card's status dot and its badge so they can never
+     drift apart (they read the same source value). Deliberately lighter than
+     --text-muted so idle and offline are distinguishable from each other. */
+  --status-idle:      #9ca3af;
+  --status-preparing: var(--yellow);
+  --status-printing:  var(--blue);
+  --status-paused:    var(--yellow);
+  --status-complete:  var(--green);
+  --status-cancelled: var(--text-muted);
+  --status-error:     var(--red);
 }
 
 body.light-mode {
@@ -209,26 +221,38 @@ main {
 .card-settings-btn:hover { color: var(--accent); background: rgba(99,102,241,.1); }
 .card-settings-btn svg { width: 18px; height: 18px; }
 
+/* Status dot — one rule per printer.state value (T3). Dot and badge read the
+   exact same "state" string from the backend, so they can never disagree. */
 .status-dot {
   width: 10px; height: 10px;
   border-radius: 50%;
   flex-shrink: 0;
-  background: var(--text-muted);
+  background: var(--status-idle);
   position: relative;
 }
-.status-dot.online     { background: var(--green);      box-shadow: 0 0 6px var(--green); }
-.status-dot.printing   { background: var(--accent);     box-shadow: 0 0 6px var(--accent); animation: pulse 1.5s ease-in-out infinite; }
-.status-dot.warmingup  { background: var(--yellow);     box-shadow: 0 0 6px var(--yellow); animation: pulse 2s ease-in-out infinite; }
-.status-dot.paused     { background: var(--yellow);     box-shadow: 0 0 6px var(--yellow); }
-.status-dot.complete   { background: var(--green);      box-shadow: 0 0 6px var(--green); }
-.status-dot.cancelled  { background: var(--red);        box-shadow: 0 0 4px var(--red); }
-.status-dot.error      { background: var(--red);        box-shadow: 0 0 6px var(--red); animation: pulse 0.8s ease-in-out infinite; }
+.status-dot.offline    { background: transparent; border: 2px solid var(--text-muted); }
+.status-dot.idle       { background: var(--status-idle); }
+.status-dot.preparing  { background: var(--status-preparing); box-shadow: 0 0 6px var(--status-preparing); animation: pulse 2.2s ease-in-out infinite; }
+.status-dot.printing   { background: var(--status-printing);  box-shadow: 0 0 6px var(--status-printing);  animation: pulse 1.2s ease-in-out infinite; }
+.status-dot.pausing,
+.status-dot.paused     { background: var(--status-paused);    box-shadow: 0 0 6px var(--status-paused); }
+.status-dot.complete   { background: var(--status-complete);  box-shadow: 0 0 6px var(--status-complete); }
+.status-dot.cancelled,
+.status-dot.stopping   { background: var(--status-cancelled); }
+.status-dot.error      { background: var(--status-error);     box-shadow: 0 0 6px var(--status-error);    animation: pulse 0.7s ease-in-out infinite; }
 .status-dot.unknown    { background: transparent; border: 2px dashed var(--text-muted); }
-.status-dot.offline    { background: var(--text-muted); }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50%       { opacity: .4; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot { animation: none !important; }
+  /* "preparing" and "paused" are both yellow and would become visually
+     identical once the pulse that normally separates them is gone — give
+     preparing a distinct hollow-ring shape instead of relying on motion. */
+  .status-dot.preparing { background: transparent; border: 3px solid var(--status-preparing); box-shadow: none; }
 }
 
 .card-remove-btn {
@@ -466,15 +490,17 @@ main {
   text-transform: uppercase;
   letter-spacing: .5px;
 }
-.status-badge.idle      { background: rgba(107,114,128,.15); color: var(--text-muted); }
-.status-badge.printing  { background: rgba(255,107,43,.15);  color: var(--accent); }
-.status-badge.warmingup { background: rgba(234,179,8,.15);   color: var(--yellow); }
-.status-badge.paused    { background: rgba(234,179,8,.15);   color: var(--yellow); }
-.status-badge.complete  { background: rgba(34,197,94,.15);   color: var(--green); }
-.status-badge.cancelled { background: rgba(239,68,68,.1);    color: var(--red); }
-.status-badge.error     { background: rgba(239,68,68,.2);    color: var(--red); }
+.status-badge.idle      { background: rgba(156,163,175,.15); color: var(--status-idle); }
+.status-badge.preparing { background: rgba(234,179,8,.15);   color: var(--status-preparing); }
+.status-badge.printing  { background: rgba(59,130,246,.15);  color: var(--status-printing); }
+.status-badge.pausing,
+.status-badge.paused    { background: rgba(234,179,8,.15);   color: var(--status-paused); }
+.status-badge.complete  { background: rgba(34,197,94,.15);   color: var(--status-complete); }
+.status-badge.cancelled,
+.status-badge.stopping  { background: rgba(107,114,128,.15); color: var(--status-cancelled); }
+.status-badge.error     { background: rgba(239,68,68,.2);    color: var(--status-error); }
 .status-badge.unknown   { background: rgba(107,114,128,.15); color: var(--text-muted); }
-.status-badge.offline   { background: rgba(239,68,68,.1);    color: var(--red); }
+.status-badge.offline   { background: rgba(107,114,128,.1);  color: var(--text-muted); }
 
 /* Reason box — why a printer is paused/stopped/errored (T2). Full icon-per-
    category treatment is T3's job; this is deliberately plain. */

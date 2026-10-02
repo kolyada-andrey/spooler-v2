@@ -224,67 +224,38 @@ function _checkActiveTrayChange(printer) {
 }
 
 // ─── Status helpers ────────────────────────────────────────────────────────────
-// PrintInfo.Status codes (from CarbonicSidecar / elegoo-homeassistant)
-const PRINT_STATUS = {
-  0:  "idle",
-  1:  "homing",
-  2:  "printing",    // bed dropping
-  3:  "printing",
-  4:  "printing",    // lifting
-  5:  "pausing",
-  6:  "paused",
-  7:  "stopping",
-  8:  "cancelled",
-  9:  "complete",
-  10: "checking",
-  12: "recovering",
-  13: "printing",    // printing (recovery)
-  14: "error",       // was incorrectly shown as "cancelled" — backend already
-                     // uses 14 for genuine errors (CC2/Moonraker/Prusa)
-  15: "warming up",
-  16: "warming up",  // preheating
-  18: "warming up",
-  19: "warming up",
-  20: "leveling",
-  21: "warming up",
-};
-
-// CurrentStatus[0] codes (machine-level state)
-const MACHINE_STATUS = {
-  0: "idle", 1: "printing", 2: "transferring", 3: "testing",
-  4: "testing", 5: "leveling", 6: "tuning", 7: "stopping",
-  8: "stopped", 9: "homing", 10: "loading", 11: "tuning", 12: "recovering",
+// The backend's PrinterConnection.to_dict() already normalizes every
+// protocol's raw status codes into a single small vocabulary (see
+// printers/base.py classify_display_state): offline, idle, preparing,
+// printing, pausing, paused, complete, cancelled, stopping, error, unknown.
+// The dot and badge both read that same "state" string directly — no more
+// separate raw-code interpretation here, so they can never disagree with
+// each other or with the backend's own notion of what's happening.
+const STATE_LABEL = {
+  offline:   "Offline",
+  idle:      "Idle",
+  preparing: "Preparing",
+  printing:  "Printing",
+  pausing:   "Pausing",
+  paused:    "Paused",
+  complete:  "Complete",
+  cancelled: "Cancelled",
+  stopping:  "Stopping",
+  error:     "Error",
+  unknown:   "Unknown status",
 };
 
 function getPrintStatus(printer) {
-  if (!printer.connected) return "offline";
-  const pi = printer.status?.PrintInfo;
-  const code = pi?.Status;
-  if (code === undefined || code === null) return "idle";
-  // Special case: CurrentStatus[0] === 9 means homing (between prints)
-  const machineCode = printer.status?.CurrentStatus?.[0];
-  if (machineCode === 9 && code === 0) return "homing";
-  // Codes with no table entry (e.g. 11, 17 — never documented) must show as
-  // "unknown", not silently collapse into "idle" as if nothing were wrong.
-  return PRINT_STATUS[code] ?? "unknown";
+  return printer.state || (printer.connected ? "idle" : "offline");
 }
 
 function statusClass(s) {
-  if (["printing", "homing", "recovering"].includes(s))        return "printing";
-  if (["warming up", "leveling", "checking"].includes(s))      return "warmingup";
-  if (["pausing", "paused"].includes(s))                       return "paused";
-  if (s === "stopping")                                         return "cancelled";
-  if (s === "cancelled")                                        return "cancelled";
-  if (s === "error")                                            return "error";
-  if (s === "complete")                                         return "complete";
-  if (s === "offline")                                          return "offline";
-  if (s === "unknown")                                          return "unknown";
-  return "idle";
+  return STATE_LABEL[s] ? s : "idle";
 }
 
 function isActivelyPrinting(printer) {
   const s = getPrintStatus(printer);
-  return ["printing", "homing", "warming up", "leveling", "checking", "recovering"].includes(s);
+  return ["printing", "preparing"].includes(s);
 }
 
 // Returns the printer object that currently has this spool loaded as its active tray, or null.
@@ -428,15 +399,20 @@ function renderPrinter(printer) {
   // survives innerHTML replacement (every printer_update would kill it otherwise)
   const prevCameraImg = card.querySelector('.card-camera img');
 
+  const stateLabel = STATE_LABEL[sc] || STATE_LABEL.unknown;
+  const badgeText  = (sc === "error" && printer.state_reason?.code)
+    ? `${status} (${printer.state_reason.code})`
+    : status;
+
   card.innerHTML = `
     <!-- Header -->
     <div class="card-header">
-      <div class="status-dot ${sc}"></div>
+      <div class="status-dot ${sc}" role="img" aria-label="${escAttr(stateLabel)}" title="${escAttr(stateLabel)}"></div>
       <div class="card-header-info">
         <div class="card-title">${escHtml(printer.name)}</div>
         <div class="card-subtitle">${escHtml(printer.ip)}${printer.attrs?.FirmwareVersion ? ` · fw ${escHtml(printer.attrs.FirmwareVersion)}` : ""}</div>
       </div>
-      <span class="status-badge ${sc}">${status}</span>
+      <span class="status-badge ${sc}">${escHtml(badgeText)}</span>
       <button class="card-files-btn" onclick="openFileBrowser('${escAttr(printer.id)}')" title="Browse files">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
@@ -2077,15 +2053,47 @@ document.getElementById("modal-changelog")?.addEventListener("click", e => {
     e.target.classList.remove("open");
 });
 
+// ─── Demo mode (?demo=states) ───────────────────────────────────────────────────
+// One synthetic card per state, side by side — lets anyone sanity-check every
+// status dot/badge/reason-box combination at once without needing a printer
+// in every possible state. No WebSocket connection is made in this mode.
+function renderDemoStates() {
+  const reasonFor = (s) => {
+    if (s === "error") return { kind: "error", initiated_by: "printer", code: "99",
+                                 category: "unknown", message: "Demo error message" };
+    if (s === "pausing" || s === "paused") return { kind: "pause", initiated_by: "unknown",
+                                 code: "", category: "unknown", message: "" };
+    if (s === "cancelled" || s === "stopping") return { kind: "stop", initiated_by: "spooler",
+                                 code: "", category: "unknown", message: "" };
+    return null;
+  };
+  Object.keys(STATE_LABEL).forEach((s) => {
+    const p = {
+      id: `demo-${s}`, ip: "demo", name: `Demo: ${STATE_LABEL[s]}`,
+      printer_type: "cc1", connected: s !== "offline",
+      state: s, state_reason: reasonFor(s),
+      status: { PrintInfo: { Filename: "demo.gcode", CurrentLayer: 10, TotalLayer: 100,
+                              PrintTime: 600, RemainTime: 900, TotalExtrusion: 1200 } },
+      attrs: {}, camera_url: null, filament_mm: 1200, filament_g: 3.6, has_access_code: false,
+    };
+    printers[p.id] = p;
+    renderPrinter(p);
+  });
+}
+
 // ─── Boot ──────────────────────────────────────────────────────────────────────
-fetch("/api/auth-status")
-  .then(r => r.json())
-  .then(({ spoolman_url }) => {
-    if (spoolman_url) document.getElementById("btn-spoolman-ui").href = spoolman_url;
-  })
-  .catch(() => {});
-loadChangelog();
-connect();
+if (new URLSearchParams(location.search).get("demo") === "states") {
+  renderDemoStates();
+} else {
+  fetch("/api/auth-status")
+    .then(r => r.json())
+    .then(({ spoolman_url }) => {
+      if (spoolman_url) document.getElementById("btn-spoolman-ui").href = spoolman_url;
+    })
+    .catch(() => {});
+  loadChangelog();
+  connect();
+}
 
 // On startup: if notifications are enabled but the subscription was cleared by the
 // browser (e.g. after cache purge), silently re-subscribe so notifications keep working.
