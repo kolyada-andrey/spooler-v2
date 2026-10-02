@@ -8,6 +8,7 @@ import json
 import ssl
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -23,7 +24,10 @@ from auth import (
     _auth_ok, _check_rate_limit, _create_session, _get_pw_hash, _get_username,
     _has_password, _invalidate_session, _parse_sid, _reset_rate_limit, _save_auth,
 )
-from persistence import DATA_DIR, load_history, save_printers
+from backup import (
+    BACKUP_DIR, RestoreError, create_backup_zip, list_auto_backups, restore_from_zip,
+)
+from persistence import DATA_DIR, current_version, load_history, save_printers
 from push import (
     WEBPUSH_AVAILABLE, add_subscription, get_public_key, has_subscriptions,
     load_notif_settings, remove_subscription, save_notif_settings, send_push_all,
@@ -40,16 +44,7 @@ KEY_FILE  = DATA_DIR / "key.pem"
 
 MAX_BODY = 100 * 1024 * 1024  # 100 MB
 
-CHANGELOG_FILE = Path(__file__).parent / "public" / "changelog.json"
-
-
-def _current_version() -> str:
-    """Same source the frontend's version badge reads: changelog.json's first entry."""
-    try:
-        entries = json.loads(CHANGELOG_FILE.read_text())
-        return entries[0]["version"]
-    except Exception:
-        return "unknown"
+_current_version = current_version  # kept as a module-local alias; call sites unchanged
 
 # When true, Spoolman's web UI is proxied through /spoolman/ on this server.
 # When false (default), /spoolman redirects the browser directly to SPOOLMAN_URL.
@@ -605,6 +600,12 @@ class SPHandler(SimpleHTTPRequestHandler):
                     mat_map[mat] = den
             materials = [{"name": m, "density": mat_map[m]} for m in sorted(mat_map)]
             self._json({"brands": brands, "materials": materials})
+        elif self.path == "/api/backup" or self.path.startswith("/api/backup?"):
+            self._handle_backup_download()
+        elif self.path == "/api/backups":
+            self._json(list_auto_backups())
+        elif self.path.startswith("/api/backups/"):
+            self._handle_backup_file_download()
         elif self.path.startswith("/api/spoolman"):
             self._proxy_spoolman("GET", self.path[len("/api/spoolman"):], None)
         elif (
@@ -677,6 +678,8 @@ class SPHandler(SimpleHTTPRequestHandler):
             self._handle_push_test()
         elif self.path == "/api/import-filaments":
             self._handle_import_filaments()
+        elif self.path == "/api/restore":
+            self._handle_restore()
         elif self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("POST", self.path, self._read_body())
         elif self.path.startswith("/api/spoolman"):
@@ -834,6 +837,88 @@ class SPHandler(SimpleHTTPRequestHandler):
             self._json({"ok": True, "response": result.decode("utf-8", errors="replace")})
         except Exception as e:
             self._json({"error": str(e)}, 500)
+
+    # ── Backup / restore ─────────────────────────────────────────────────────
+
+    def _handle_backup_download(self):
+        qs = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(qs)
+        include_secrets = params.get("include_secrets", ["0"])[0].lower() in ("1", "true", "yes")
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip")
+        os.close(tmp_fd)
+        try:
+            manifest = create_backup_zip(Path(tmp_name), include_secrets=include_secrets)
+            data = Path(tmp_name).read_bytes()
+        except Exception as e:
+            self._json({"error": f"Backup failed: {e}"}, 500)
+            return
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        date = time.strftime("%Y-%m-%d")
+        filename = f"spooler-backup-{manifest['spooler_version']}-{date}.zip"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_backup_file_download(self):
+        # Only ever resolve by exact match against what list_auto_backups()
+        # itself already reports -- the requested name is never joined onto
+        # a filesystem path, so a "../.." in it just fails to match anything.
+        name = urllib.parse.unquote(self.path[len("/api/backups/"):].split("?")[0])
+        if name not in {b["name"] for b in list_auto_backups()}:
+            self._json({"error": "Not found"}, 404)
+            return
+        data = (BACKUP_DIR / name).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_restore(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._json({"error": "No file uploaded"}, 400)
+            return
+        body = self._read_body()
+        if body is None:
+            return  # _read_body() already sent a 413 if the body was too large
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip")
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(body)
+            manifest = restore_from_zip(Path(tmp_name))
+        except RestoreError as e:
+            self._json({"error": str(e)}, 400)
+            return
+        except Exception as e:
+            self._json({"error": f"Restore failed: {e}"}, 500)
+            return
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        self._json({
+            "ok": True,
+            "manifest": manifest,
+            "message": "Restored. Spooler is restarting — reload this page in a few seconds.",
+        })
+        # In-memory state (loaded printer connections and their live asyncio
+        # tasks, the cached VAPID key, auth sessions) can't be safely swapped
+        # out from under a running process -- a controlled restart is the
+        # robust way to pick up the restored files everywhere. Delayed so the
+        # response above actually reaches the client first. Docker's
+        # restart: unless-stopped brings the container back automatically;
+        # outside Docker the process needs restarting by hand.
+        threading.Timer(1.0, lambda: os._exit(0)).start()
 
     # ── Response helper ───────────────────────────────────────────────────────
 

@@ -1317,6 +1317,26 @@ main {
 .settings-printer-meta { font-size: 12px; color: var(--text-muted); }
 .settings-printer-empty { color: var(--text-muted); font-size: 14px; text-align: center; padding: 24px 0; }
 
+/* ─── Backup settings ─────────────────────────────────────────────────────── */
+.backup-section { padding: 16px 0; border-bottom: 1px solid var(--border); }
+.backup-section:last-child { border-bottom: none; }
+.backup-section h4 { font-size: 13px; margin-bottom: 6px; }
+.backup-desc { font-size: 12px; color: var(--text-muted); margin-bottom: 10px; }
+.backup-warning { color: var(--yellow); }
+.backup-checkbox-row {
+  display: flex; align-items: flex-start; gap: 8px;
+  font-size: 12px; color: var(--text-muted); margin-bottom: 12px; cursor: pointer;
+}
+.backup-checkbox-row input { margin-top: 2px; flex-shrink: 0; }
+#backup-restore-file { display: block; margin-bottom: 10px; font-size: 12px; }
+.backup-auto-list { display: flex; flex-direction: column; gap: 6px; }
+.backup-auto-row {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px; padding: 6px 0; border-bottom: 1px solid var(--border);
+}
+.backup-auto-row:last-child { border-bottom: none; }
+.backup-auto-empty { font-size: 12px; color: var(--text-muted); }
+
 /* ─── Notification settings ───────────────────────────────────────────────── */
 .notif-list { display: flex; flex-direction: column; gap: 0; margin: 16px 0 24px; }
 .notif-row {

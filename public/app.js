@@ -783,8 +783,9 @@ const _settingsPwPage         = document.getElementById("settings-change-passwor
 const _settingsNotifPage      = document.getElementById("settings-notifications");
 const _settingsPrintersPage   = document.getElementById("settings-printers");
 const _settingsPrinterEditPage = document.getElementById("settings-printer-edit");
+const _settingsBackupPage     = document.getElementById("settings-backup");
 
-const _allSettingsPages = () => [_settingsPwPage, _settingsNotifPage, _settingsPrintersPage, _settingsPrinterEditPage];
+const _allSettingsPages = () => [_settingsPwPage, _settingsNotifPage, _settingsPrintersPage, _settingsPrinterEditPage, _settingsBackupPage];
 
 function _openSettings() {
   _allSettingsPages().forEach(p => p && (p.style.display = "none"));
@@ -1054,6 +1055,72 @@ document.getElementById("btn-settings-goto-notifications")?.addEventListener("cl
   _showSettingsPage(_settingsNotifPage);
 });
 document.getElementById("btn-settings-back-notif")?.addEventListener("click", _backToSettingsMenu);
+
+// ─── Backup / restore ───────────────────────────────────────────────────────
+async function _renderAutoBackupList() {
+  const list = document.getElementById("backup-auto-list");
+  if (!list) return;
+  list.innerHTML = '<span class="backup-auto-empty">Loading…</span>';
+  try {
+    const r = await fetch("/api/backups");
+    const backups = r.ok ? await r.json() : [];
+    if (!backups.length) {
+      list.innerHTML = '<span class="backup-auto-empty">No automatic backups yet.</span>';
+      return;
+    }
+    list.innerHTML = backups.map(b => {
+      const date = new Date(b.modified * 1000).toLocaleString();
+      const kb   = (b.size / 1024).toFixed(0);
+      return `<div class="backup-auto-row">
+        <span>${escHtml(date)} · ${kb} KB</span>
+        <a href="/api/backups/${encodeURIComponent(b.name)}" class="btn btn-secondary btn-sm">Download</a>
+      </div>`;
+    }).join("");
+  } catch (_) {
+    list.innerHTML = '<span class="backup-auto-empty">Could not load backups.</span>';
+  }
+}
+
+document.getElementById("btn-settings-goto-backup")?.addEventListener("click", () => {
+  _showSettingsPage(_settingsBackupPage);
+  _renderAutoBackupList();
+});
+document.getElementById("btn-settings-back-backup")?.addEventListener("click", _backToSettingsMenu);
+
+document.getElementById("btn-backup-download")?.addEventListener("click", () => {
+  const includeSecrets = document.getElementById("backup-include-secrets")?.checked;
+  const url = `/api/backup${includeSecrets ? "?include_secrets=1" : ""}`;
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
+
+document.getElementById("btn-backup-restore")?.addEventListener("click", async () => {
+  const input = document.getElementById("backup-restore-file");
+  const file = input?.files?.[0];
+  if (!file) {
+    toast("Choose a backup file first");
+    return;
+  }
+  if (!confirm("This overwrites current printers, history and settings with the contents of this backup, and restarts Spooler. Continue?")) {
+    return;
+  }
+  try {
+    const r = await fetch("/api/restore", { method: "POST", body: file });
+    const data = await r.json();
+    if (!r.ok) {
+      toast(data.error || "Restore failed", true);
+      return;
+    }
+    toast(data.message || "Restored — reloading…");
+    setTimeout(() => location.reload(), 4000);
+  } catch (e) {
+    toast("Restore failed: " + e.message, true);
+  }
+});
 document.getElementById("btn-notif-save")?.addEventListener("click", async () => {
   const gb = id => document.getElementById(id)?.checked ?? false;
   const gv = id => parseFloat(document.getElementById(id)?.value) || 0;

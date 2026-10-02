@@ -153,6 +153,17 @@ Printer configs are saved and reconnect automatically on restart.
 
 ---
 
+## Backup & restore
+
+Settings → **Backup** lets you download a zip of your printers, history, spool-tray links and notification settings, and restore from one later.
+
+- Printer access codes (CC2 MQTT password, Moonraker/PrusaLink API key) are left out of the download by default — check **Include secrets** if you want them included.
+- Restoring overwrites current data with the backup's contents. A safety copy of whatever was there before is taken automatically first, in case you need to undo it.
+- Spooler **restarts immediately** after a successful restore to apply it everywhere — your browser will reconnect on its own after a few seconds.
+- Automatic backups are taken daily and before version upgrades, kept in `DATA_DIR/backups/` (last 7 by default — see `.env.example` for `SPOOLER_AUTO_BACKUP_DAILY` / `SPOOLER_BACKUP_KEEP`), and listed in the same Settings page for download.
+
+---
+
 ## Spoolman
 
 Spooler integrates with **[Spoolman](https://github.com/Donkie/Spoolman)**, an open-source filament spool manager.

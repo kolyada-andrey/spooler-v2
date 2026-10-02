@@ -11,7 +11,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="Spooler" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <link rel="stylesheet" href="style.css?v=30" />
+  <link rel="stylesheet" href="style.css?v=31" />
 </head>
 <body>
   <header>
@@ -396,6 +396,14 @@
             <span>Notifications</span>
             <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
           </button>
+          <button class="settings-menu-item" id="btn-settings-goto-backup">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            <span>Backup</span>
+            <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
           <div class="settings-menu-item settings-toggle-row">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
@@ -554,6 +562,38 @@
           <button id="btn-notif-save" class="btn btn-primary">Save</button>
         </div>
       </div>
+      <!-- Backup sub-page -->
+      <div id="settings-backup" style="display:none">
+        <div class="settings-subpage-header">
+          <button id="btn-settings-back-backup" class="settings-back-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
+          <h3>Backup</h3>
+        </div>
+
+        <div class="backup-section">
+          <h4>Download backup</h4>
+          <p class="backup-desc">Printers, history, spool-tray links and notification settings.</p>
+          <label class="backup-checkbox-row">
+            <input type="checkbox" id="backup-include-secrets" />
+            <span>Include secrets (printer access codes) — off by default; without them, codes must be re-entered after restoring</span>
+          </label>
+          <button id="btn-backup-download" class="btn btn-primary">Download backup</button>
+        </div>
+
+        <div class="backup-section">
+          <h4>Restore from file</h4>
+          <p class="backup-desc backup-warning">This overwrites current printers, history and settings. A safety copy of the current state is taken automatically first. Spooler restarts immediately after.</p>
+          <input type="file" id="backup-restore-file" accept=".zip" />
+          <button id="btn-backup-restore" class="btn btn-danger">Restore</button>
+        </div>
+
+        <div class="backup-section">
+          <h4>Automatic backups</h4>
+          <p class="backup-desc">Taken daily and before version upgrades. Last 7 are kept.</p>
+          <div id="backup-auto-list" class="backup-auto-list"></div>
+        </div>
+      </div>
       <!-- Change password sub-page -->
       <div id="settings-change-password" style="display:none">
         <div class="settings-subpage-header">
@@ -593,7 +633,7 @@
 
   <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
   <script src="/config.js"></script>
-  <script src="app.js?v=43"></script>
+  <script src="app.js?v=44"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").catch(() => {});

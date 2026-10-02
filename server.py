@@ -56,6 +56,7 @@ except ImportError:
 import auth
 import state
 from auth import AUTH_ENABLED, BCRYPT_AVAILABLE, session_cleanup_loop
+from backup import check_startup_backup, daily_backup_loop
 from http_handler import run_http, run_https, set_ws_adopter
 from persistence import DATA_DIR, load_printers, load_tray_map, migrate_history_ids
 from printers import PRINTER_TYPES, make_printer
@@ -106,6 +107,7 @@ async def main() -> None:
         print(f"[Auth] Authentication enabled (user: {auth._get_username()})")
 
     init_vapid()
+    check_startup_backup()
     migrate_history_ids()
 
     # Load saved printers
@@ -129,6 +131,7 @@ async def main() -> None:
     state.tray_map = load_tray_map()
 
     asyncio.create_task(session_cleanup_loop())
+    asyncio.create_task(daily_backup_loop())
 
     # Let the plain HTTP server (port HTTP_PORT) also adopt WebSocket upgrade
     # requests it sees — combo mode, so single-port tunnels/proxies work.

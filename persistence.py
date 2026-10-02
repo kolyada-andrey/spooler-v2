@@ -18,6 +18,17 @@ HISTORY_FILE  = DATA_DIR / "history.json"
 TRAY_MAP_FILE = DATA_DIR / "tray_map.json"
 RAW_DIR       = DATA_DIR / "raw"
 
+CHANGELOG_FILE = Path(__file__).parent / "public" / "changelog.json"
+
+
+def current_version() -> str:
+    """Same source the frontend's version badge reads: changelog.json's first entry."""
+    try:
+        entries = json.loads(CHANGELOG_FILE.read_text())
+        return entries[0]["version"]
+    except Exception:
+        return "unknown"
+
 # Set SPOOLER_DEBUG_RAW=1 to dump every raw printer message to RAW_DIR, one
 # newline-delimited JSON file per printer. Used to collect real fixtures from
 # a printer owner's hardware for tests/fixtures/ — never enabled by default,
