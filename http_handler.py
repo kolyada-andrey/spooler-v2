@@ -649,6 +649,9 @@ class SPHandler(SimpleHTTPRequestHandler):
         elif self.path == "/api/backup" or self.path.startswith("/api/backup?"):
             self._handle_backup_download()
         elif self.path == "/api/backups":
+            if not is_enabled("backup"):
+                self._json({"error": "feature_disabled", "feature": "backup"}, 403)
+                return
             self._json(list_auto_backups())
         elif self.path.startswith("/api/backups/"):
             self._handle_backup_file_download()
@@ -899,6 +902,7 @@ class SPHandler(SimpleHTTPRequestHandler):
 
     # ── Backup / restore ─────────────────────────────────────────────────────
 
+    @requires_feature("backup")
     def _handle_backup_download(self):
         qs = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(qs)
@@ -925,6 +929,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    @requires_feature("backup")
     def _handle_backup_file_download(self):
         # Only ever resolve by exact match against what list_auto_backups()
         # itself already reports -- the requested name is never joined onto
@@ -941,6 +946,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    @requires_feature("backup")
     def _handle_restore(self):
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:

@@ -7,6 +7,7 @@ import zipfile
 import pytest
 
 import backup
+import features
 import persistence
 
 
@@ -253,3 +254,27 @@ def test_list_auto_backups_reports_name_size_modified():
     assert len(entries) == 1
     assert set(entries[0]) == {"name", "size", "modified"}
     assert entries[0]["size"] > 0
+
+
+# ── Gated by the "backup" feature flag ───────────────────────────────────────
+
+def test_backup_feature_defaults_on():
+    assert features.is_enabled("backup") is True
+
+
+def test_check_startup_backup_skipped_when_feature_off():
+    features.set_enabled("backup", False)
+    backup._VERSION_MARKER.write_text("0.0.1")  # version changed -- would normally back up
+    _write("printers.json", [])
+    backup.check_startup_backup()
+    assert list(backup.BACKUP_DIR.glob("pre-upgrade-*.zip")) == []
+    # Marker deliberately NOT updated while the feature is off, so turning it
+    # back on still catches the version change it missed this time.
+    assert backup._VERSION_MARKER.read_text().strip() == "0.0.1"
+
+
+def test_maybe_daily_backup_skipped_when_feature_off(monkeypatch):
+    monkeypatch.setattr(backup, "AUTO_BACKUP_DAILY", True)
+    features.set_enabled("backup", False)
+    backup.maybe_daily_backup()
+    assert list(backup.BACKUP_DIR.glob("daily-*.zip")) == []

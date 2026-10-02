@@ -44,6 +44,10 @@ FEATURES: dict = {
         key="camera", name="Camera", default=True,
         description="Live camera feed on each printer card.",
     ),
+    "backup": Feature(
+        key="backup", name="Backup & restore", default=True,
+        description="Manual backup/restore and automatic daily + pre-upgrade backups.",
+    ),
     "spoolman": Feature(
         key="spoolman", name="Spoolman integration", default=True,
         description="Filament spool inventory, tray linking, and automatic deduction after each print.",

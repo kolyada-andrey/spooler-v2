@@ -22,6 +22,7 @@ import time
 import zipfile
 from pathlib import Path
 
+from features import is_enabled
 from persistence import DATA_DIR, _atomic_write, current_version
 
 BACKUP_DIR = DATA_DIR / "backups"
@@ -261,7 +262,15 @@ _DAILY_MARKER   = DATA_DIR / ".last_daily_backup"
 def check_startup_backup() -> None:
     """Back up before any migration runs, if the Spooler version differs from
     the last recorded startup. Skipped on a brand-new install -- with no
-    prior version recorded there's nothing meaningful to protect yet."""
+    prior version recorded there's nothing meaningful to protect yet.
+
+    Also skipped entirely while the "backup" feature is off -- deliberately
+    does NOT update _VERSION_MARKER in that case either, so turning the
+    feature back on later still catches the version change it missed instead
+    of silently treating it as already-seen.
+    """
+    if not is_enabled("backup"):
+        return
     current = current_version()
     try:
         last = _VERSION_MARKER.read_text().strip()
@@ -278,7 +287,9 @@ def check_startup_backup() -> None:
 
 
 def maybe_daily_backup() -> None:
-    if not AUTO_BACKUP_DAILY:
+    # Checked every call (not just once) so toggling "backup" off in Settings
+    # -> Features stops future automatic backups immediately, no restart needed.
+    if not AUTO_BACKUP_DAILY or not is_enabled("backup"):
         return
     now = time.time()
     try:

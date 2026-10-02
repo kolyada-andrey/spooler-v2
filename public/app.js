@@ -1761,6 +1761,14 @@ function _applyFeatures(list) {
   Object.values(printers).forEach(renderPrinter);
   const spoolsBtn = document.getElementById("btn-spools");
   if (spoolsBtn) spoolsBtn.style.display = featureEnabled("spoolman") ? "" : "none";
+  const backupBtn = document.getElementById("btn-settings-goto-backup");
+  if (backupBtn) backupBtn.style.display = featureEnabled("backup") ? "" : "none";
+  // If the backup settings page is open when the feature gets turned off
+  // (e.g. toggled from another tab), don't leave the user stranded on a
+  // now-hidden page.
+  if (!featureEnabled("backup") && _settingsBackupPage && _settingsBackupPage.style.display !== "none") {
+    _backToSettingsMenu();
+  }
   if (_settingsFeaturesPage && _settingsFeaturesPage.style.display !== "none") {
     _renderFeaturesList();
   }
@@ -1769,6 +1777,7 @@ function _applyFeatures(list) {
 const _FEATURE_GROUPS = [
   { title: "Monitoring",    keys: ["camera"] },
   { title: "Notifications", keys: ["notifications", "notify_webpush"] },
+  { title: "Data",          keys: ["backup"] },
   { title: "Integrations",  keys: ["spoolman"] },
 ];
 
