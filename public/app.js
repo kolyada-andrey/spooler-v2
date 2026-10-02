@@ -417,6 +417,21 @@ function formatTimeLong(secs) {
   return `${String(h).padStart(2, "0")}h${String(m).padStart(2, "0")}m${String(s).padStart(2, "0")}s`;
 }
 
+// Manually formats hours/minutes (never via toLocaleTimeString) so the
+// result is always 24-hour regardless of the browser's locale.
+function formatFinishAt(remainingSecs) {
+  if (!remainingSecs || remainingSecs <= 0) return null;
+  const now    = new Date();
+  const finish = new Date(now.getTime() + remainingSecs * 1000);
+  const time   = `${String(finish.getHours()).padStart(2, "0")}:${String(finish.getMinutes()).padStart(2, "0")}`;
+  const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const daysAhead = Math.round((startOfDay(finish) - startOfDay(now)) / 86400000);
+  if (daysAhead <= 0) return `Done ~${time}`;
+  if (daysAhead === 1) return `Done tomorrow ${time}`;
+  const dateStr = finish.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return `Done ${dateStr}, ${time}`;
+}
+
 function tempColor(t) {
   if (!t) return "";
   if (t > 150) return "hot";
@@ -517,6 +532,13 @@ function renderPrinter(printer) {
         <span>Elapsed: ${formatTime(elapsed)}</span>
         <span>Remaining: ${formatTime(remaining)}</span>
       </div>
+      ${paused
+        ? `<div class="finish-time">Paused — finish time updates when print resumes</div>`
+        : (() => {
+            const finishLabel = formatFinishAt(remaining);
+            return finishLabel ? `<div class="finish-time">${escHtml(finishLabel)}</div>` : "";
+          })()
+      }
       ${filamentMm > 0 ? `
       <div class="filament-info">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -570,7 +592,7 @@ function renderPrinter(printer) {
         const linkedChip = linkedSpool
           ? `<div class="canvas-tray-spool" title="${escAttr(spoolName(linkedSpool))}">
                <div class="canvas-tray-spool-dot" style="background:${escAttr(spoolColorHex(linkedSpool))}"></div>
-               <span>${escHtml(spoolName(linkedSpool).split(" ").slice(0,2).join(" "))}</span>
+               <span>${escHtml(spoolName(linkedSpool))}</span>
              </div>`
           : `<div class="canvas-tray-spool canvas-tray-spool-empty">No spool</div>`;
         return `<div class="canvas-tray${active ? " canvas-tray-active" : ""}"
@@ -630,9 +652,11 @@ function renderPrinter(printer) {
         </button>
       ` : ""}
       <div class="controls-spacer"></div>
-      <button class="btn btn-sm ${lightOn ? "btn-primary" : "btn-secondary"}"
+      <button class="btn btn-sm btn-secondary${lightOn ? " btn-light-on" : ""}"
               onclick="printerAction('${escAttr(printer.id)}','${lightOn ? "light_off" : "light_on"}')"
-              title=""
+              title="${lightOn ? "Light on" : "Light off"}"
+              aria-label="${lightOn ? "Light on" : "Light off"}"
+              aria-pressed="${lightOn}"
               ${!connected ? "disabled" : ""}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="5"/>
@@ -685,6 +709,29 @@ function renderPrinter(printer) {
       img.addEventListener('error', () => { img.style.display = 'none'; placeholder.style.display = 'flex'; });
       cameraDiv.insertBefore(img, cameraDiv.firstChild);
     }
+  }
+
+  // Only CC2 currently reports LightStatus -- printers that never report it
+  // (CC1) must not show this, since getLightOn() falling back to "off" for
+  // them would make the overlay permanently cover a working camera feed.
+  const lightKnown = printer.status?.LightStatus != null;
+  let lightOverlay = cameraDiv.querySelector('.camera-light-overlay');
+  if (cameraUrl && connected && lightKnown && !lightOn) {
+    if (!lightOverlay) {
+      lightOverlay = document.createElement('div');
+      lightOverlay.className = 'camera-light-overlay';
+      lightOverlay.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="5"/>
+          <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+        <span>Light off</span>
+      `;
+      lightOverlay.addEventListener('click', () => printerAction(printer.id, 'light_on'));
+      cameraDiv.appendChild(lightOverlay);
+    }
+  } else if (lightOverlay) {
+    lightOverlay.remove();
   }
 }
 

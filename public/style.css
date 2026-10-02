@@ -15,6 +15,10 @@
   --blue:        #3b82f6;
   --text:        #e8eaf0;
   --text-muted:  #6b7280;
+  /* Lighter than --text-muted — for small "empty state" labels that must hit
+     WCAG AA (4.5:1) against --surface/--surface2, which --text-muted fails
+     on this dark background (~3.6:1). */
+  --text-dim-strong: #9ca3af;
   --radius:      12px;
   --radius-sm:   8px;
   --shadow:      0 4px 24px rgba(0,0,0,.5);
@@ -39,6 +43,7 @@ body.light-mode {
   --border:   #d0d3de;
   --text:     #1a1c2a;
   --text-muted: #6b7280;
+  --text-dim-strong: #6b7280; /* already passes 4.5:1 against the light surfaces */
   --shadow:   0 4px 24px rgba(0,0,0,.1);
 }
 
@@ -130,6 +135,12 @@ header {
 .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
 .btn-secondary:hover:not(:disabled) { background: var(--border); }
 
+/* Light-on state: a dedicated expression instead of the orange btn-primary
+   fill, since orange is reserved for primary actions (Resume, etc.) and
+   using it here made the light button read as a second call-to-action. */
+.btn-light-on { border-color: var(--yellow); color: var(--yellow); }
+.btn-light-on:hover:not(:disabled) { background: var(--surface2); border-color: var(--yellow); }
+
 .btn-danger { background: var(--red); color: #fff; }
 .btn-danger:hover:not(:disabled) { background: #dc2626; }
 
@@ -188,7 +199,12 @@ main {
 
 .printer-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  /* Cards don't all have the same content height (Canvas tray strip, print
+     progress, etc. are conditional) -- stretch (the grid default) would pad
+     shorter cards with dead space at the bottom to match their tallest
+     row-mate, so size each card to its own content instead. */
+  align-items: start;
   gap: 20px;
 }
 
@@ -310,6 +326,24 @@ main {
 }
 .camera-placeholder svg { width: 40px; height: 40px; opacity: .3; }
 
+.camera-light-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: rgba(0,0,0,.6);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background .15s;
+}
+.camera-light-overlay:hover { background: rgba(0,0,0,.75); }
+.camera-light-overlay svg { width: 32px; height: 32px; color: var(--yellow); opacity: .9; }
+
 /* Print Progress */
 .card-progress-wrap {
   padding: 14px 18px;
@@ -348,6 +382,11 @@ main {
   font-size: 12px;
   color: var(--text-muted);
   margin-top: 6px;
+}
+.finish-time {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
 }
 
 /* ─── Canvas multi-material tray strip ───────────────────────────────────── */
@@ -435,7 +474,7 @@ main {
   flex-shrink: 0;
 }
 .canvas-tray-spool-empty {
-  color: var(--border);
+  color: var(--text-dim-strong);
   font-style: italic;
 }
 .canvas-tray:hover {
