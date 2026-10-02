@@ -6,8 +6,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssl \
 
 RUN pip install --no-cache-dir websockets==17.1 aiomqtt bcrypt pywebpush
 
-COPY server.py state.py auth.py persistence.py discovery.py spoolman.py \
-     ws_handler.py http_handler.py push.py ./
+# Glob rather than an explicit file list -- an explicit list silently drops
+# new top-level modules when one is added and this file isn't updated to
+# match (happened with backup.py and features.py: both shipped fine in dev,
+# then crash-looped in the actual Docker image with ModuleNotFoundError since
+# the old explicit COPY line never named them).
+COPY *.py ./
 COPY printers/ printers/
 COPY public/ public/
 
