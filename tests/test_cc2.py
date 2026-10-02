@@ -45,8 +45,17 @@ def test_protocol_reason_hint_surfaces_raw_code_only(printer):
     printer._cc2_state["machine_status"] = {"sub_status": 2501}
     hint = printer._protocol_reason_hint()
     assert hint["code"] == 42
-    assert hint["category"] == "unknown"  # never guessed
+    assert hint["category"] == "unknown"  # never guessed -- not in error_codes.py
+    assert hint["message"] == ""
     assert hint["raw"] == {"error_code": 42, "sub_status": 2501}
+
+
+def test_protocol_reason_hint_resolves_known_error_code(printer):
+    printer._cc2_state["error_code"] = 704
+    hint = printer._protocol_reason_hint()
+    assert hint["code"] == 704
+    assert hint["category"] == "leveling"
+    assert hint["message"] == "Leveling failed. Please try again."
 
 
 @pytest.mark.asyncio

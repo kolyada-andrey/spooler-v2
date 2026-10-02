@@ -352,6 +352,7 @@ const _REASON_CATEGORY_LABEL = {
   collision:       "Collision detected",
   power_loss:      "Power loss",
   door_open:       "Door open",
+  leveling:        "Leveling failed",
   user:            "User action",
   unknown:         "Reason not yet identified",
 };

@@ -13,6 +13,7 @@ from pathlib import Path
 import state
 from persistence import dump_raw_message
 from printers.base import PrinterConnection
+from printers.error_codes import lookup as lookup_error_code
 from spoolman import spoolman_assign, spoolman_set_location
 from printers.protocol import (
     CMD_LIGHT, CMD_PAUSE, CMD_RESUME, CMD_STOP,
@@ -409,17 +410,19 @@ class CC2Connection(PrinterConnection):
                 spoolman_set_location(spool_id, self.id)
 
     def _protocol_reason_hint(self) -> dict | None:
-        # error_code's possible values and meanings aren't verified against
-        # real hardware yet — surface the raw code only, never guess a
-        # category or message from it.
+        # Most error_code values aren't verified against real hardware yet —
+        # only codes present in printers/error_codes.py have a confirmed
+        # category/message; everything else surfaces raw with "unknown"
+        # rather than guessing.
         error_code = self._cc2_state.get("error_code")
         sub_status = self._cc2_state.get("machine_status", {}).get("sub_status")
         if not error_code:
             return None
+        known = lookup_error_code(error_code)
         return {
             "code":     error_code,
-            "category": "unknown",
-            "message":  "",
+            "category": known["category"] if known else "unknown",
+            "message":  known["message"] if known else "",
             "raw":      {"error_code": error_code, "sub_status": sub_status},
         }
 
