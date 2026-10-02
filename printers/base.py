@@ -162,6 +162,13 @@ class PrinterConnection:
         self.state_reason: dict | None = None
         self._last_spooler_cmd_at: float | None = None
         self._current_print_pauses: list = []
+        # Epoch seconds (not an ISO string) deliberately — the frontend does
+        # "how long ago was this" math against it, which an ISO string without
+        # a timezone suffix (as time.strftime("%Y-%m-%dT%H:%M:%S") produces
+        # elsewhere in this file) would make ambiguous across server/browser
+        # timezones. Updated in _broadcast_state(), not here, so it reflects
+        # the last time we actually heard from the printer, not construction.
+        self.last_seen: float | None = None
 
     # ── Public interface ───────────────────────────────────────────────────────
 
@@ -224,6 +231,7 @@ class PrinterConnection:
             "state":           classify_display_state(
                                    self.connected, pi.get("Status"), self._is_homing_between_prints()),
             "state_reason":    self.state_reason,
+            "last_seen":       self.last_seen,
             "attrs":           self.attrs,
             "camera_url":      self.camera_url,
             "filament_mm":     round(filament_mm, 1),
@@ -349,6 +357,12 @@ class PrinterConnection:
         ns["last_status"] = status
 
     async def _broadcast_state(self) -> None:
+        # Only mark "seen" while actually connected -- _broadcast_state() is
+        # also called right after a disconnect (connected already flipped to
+        # False by the caller) to notify browsers of that, which is not a
+        # sign of life from the printer and must not refresh the timestamp.
+        if self.connected:
+            self.last_seen = time.time()
         self._check_notifications()
         await state.broadcast_to_browsers({
             "type":    "printer_update",

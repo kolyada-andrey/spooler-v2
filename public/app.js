@@ -26,7 +26,6 @@ if (window.SPOOLER_WS_HOST) {
   WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
 }
 const SPOOLMAN_URL = "/api/spoolman/api/v1";
-const RECONNECT_DELAY = 3000;
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
 (function () {
@@ -113,11 +112,34 @@ async function loadFilamentMeta() {
 }
 
 // ─── WebSocket connection ──────────────────────────────────────────────────────
+// Exponential backoff instead of a fixed delay — reconnecting instantly in a
+// tight loop against a server that's actually down just adds load for no
+// benefit; reconnecting fast is far more useful in the common case (a brief
+// network blip), so the delay starts short and only grows if it keeps failing.
+const RECONNECT_DELAYS = [1000, 2000, 5000, 10000, 30000];
+let _reconnectAttempt = 0;
+let _reconnectTimer = null;
+
+function _showConnBanner() {
+  document.getElementById("conn-banner").hidden = false;
+  document.body.classList.add("ws-disconnected");
+}
+function _hideConnBanner() {
+  document.getElementById("conn-banner").hidden = true;
+  document.body.classList.remove("ws-disconnected");
+}
+
 function connect() {
+  clearTimeout(_reconnectTimer);
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
     console.log("[WS] Connected");
+    _reconnectAttempt = 0;
+    _hideConnBanner();
+    // Always re-fetch full state on (re)connect, not just the initial load —
+    // whatever happened while disconnected (printer events we never saw)
+    // must not linger as stale data once the connection is back.
     send({ action: "list_printers" });
     loadHistory();
     fetchSpools();
@@ -134,7 +156,10 @@ function connect() {
   ws.onclose = (ev) => {
     if (ev.code === 1008) { location.replace("/login"); return; }
     console.warn("[WS] Disconnected, retrying…");
-    setTimeout(connect, RECONNECT_DELAY);
+    _showConnBanner();
+    const delay = RECONNECT_DELAYS[Math.min(_reconnectAttempt, RECONNECT_DELAYS.length - 1)];
+    _reconnectAttempt++;
+    _reconnectTimer = setTimeout(connect, delay);
   };
 
   ws.onerror = () => ws.close();
@@ -145,6 +170,22 @@ function send(obj) {
     ws.send(JSON.stringify(obj));
   }
 }
+
+// Mobile browsers routinely kill WebSockets while a tab/PWA is backgrounded.
+// Don't wait for the next scheduled reconnect (which could be up to 30s into
+// an already-stale backoff) once the user actually comes back to look at it.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    _reconnectAttempt = 0;
+    clearTimeout(_reconnectTimer);
+    connect();
+  } else if (ws.readyState === WebSocket.OPEN) {
+    send({ action: "list_printers" });
+    loadHistory();
+    fetchSpools();
+  }
+});
 
 // ─── Message handling ──────────────────────────────────────────────────────────
 function handleMessage(msg) {
@@ -256,6 +297,22 @@ function statusClass(s) {
 function isActivelyPrinting(printer) {
   const s = getPrintStatus(printer);
   return ["printing", "preparing"].includes(s);
+}
+
+// Data goes stale faster while actively printing (30s) than otherwise (2min)
+// -- a frozen temperature reading matters a lot more mid-print than while idle.
+function isStale(printer) {
+  if (!printer.connected || printer.last_seen == null) return false; // offline is its own distinct state
+  const thresholdS = isActivelyPrinting(printer) ? 30 : 120;
+  return (Date.now() / 1000 - printer.last_seen) > thresholdS;
+}
+
+function formatAgo(epochSeconds) {
+  const diff = Math.max(0, Math.round(Date.now() / 1000 - epochSeconds));
+  if (diff < 60) return `${diff}s ago`;
+  const mins = Math.round(diff / 60);
+  if (mins < 60) return `${mins}m ago`;
+  return `${Math.round(mins / 60)}h ago`;
 }
 
 // Returns the printer object that currently has this spool loaded as its active tray, or null.
@@ -377,6 +434,8 @@ function renderPrinter(printer) {
   const printing = isActivelyPrinting(printer);
   const paused   = isPaused(printer);
   const connected = printer.connected;
+  const stale     = isStale(printer);
+  card.classList.toggle("card-stale", stale);
 
   const nozzle     = printer.status?.TempOfNozzle    ?? printer.status?.NozzleTemp    ?? 0;
   const nozzleTgt  = printer.status?.TempTargetNozzle?? printer.status?.NozzleTempTarget ?? 0;
@@ -421,6 +480,7 @@ function renderPrinter(printer) {
     </div>
 
     ${renderReasonBox(printer)}
+    ${stale ? `<div class="stale-notice">Last updated ${formatAgo(printer.last_seen)}</div>` : ""}
 
     <!-- Camera -->
     <div class="card-camera">
@@ -592,6 +652,7 @@ function renderPrinter(printer) {
       // to force reconnect (avoids stale broken stream from a prior disconnect)
       if (!prevCameraImg._connected && connected) {
         prevCameraImg.src = cameraUrl;
+        prevCameraImg._lastFrameAt = Date.now();
       }
       prevCameraImg._connected = connected;
       cameraDiv.insertBefore(prevCameraImg, cameraDiv.firstChild);
@@ -602,9 +663,28 @@ function renderPrinter(printer) {
       img.src = cameraUrl;
       img.alt = 'Camera feed';
       img._connected = connected;
-      img.addEventListener('load',  () => { placeholder.style.display = 'none'; });
+      img._lastFrameAt = Date.now();
+      // Each MJPEG part (multipart/x-mixed-replace) re-fires "load" as it
+      // replaces the displayed frame, so time-since-last-load is a reliable
+      // signal the stream actually stopped producing new frames, not just
+      // that the initial connection succeeded once.
+      img.addEventListener('load',  () => { placeholder.style.display = 'none'; img._lastFrameAt = Date.now(); });
       img.addEventListener('error', () => { img.style.display = 'none'; placeholder.style.display = 'flex'; });
       cameraDiv.insertBefore(img, cameraDiv.firstChild);
+    }
+    const liveImg = cameraDiv.querySelector('img');
+    const stalledFrame = liveImg && liveImg.style.display !== 'none'
+      && (Date.now() - (liveImg._lastFrameAt || 0)) > 10000;
+    let overlay = cameraDiv.querySelector('.camera-stale-overlay');
+    if (stalledFrame) {
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'camera-stale-overlay';
+        overlay.textContent = 'Camera image not updated';
+        cameraDiv.appendChild(overlay);
+      }
+    } else if (overlay) {
+      overlay.remove();
     }
   }
 }
@@ -2093,6 +2173,10 @@ if (new URLSearchParams(location.search).get("demo") === "states") {
     .catch(() => {});
   loadChangelog();
   connect();
+  // Staleness is purely a function of wall-clock time passing, not of new
+  // data arriving — a card can go stale with no new printer_update at all,
+  // so it needs its own tick independent of the WS message flow.
+  setInterval(() => Object.values(printers).forEach(renderPrinter), 10000);
 }
 
 // On startup: if notifications are enabled but the subscription was cleared by the

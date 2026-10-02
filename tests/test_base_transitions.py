@@ -6,6 +6,8 @@ and send_cmd() are never called, only the status-transition machinery, so the
 abstract methods raising NotImplementedError never matters here.
 """
 
+import time
+
 import pytest
 
 import persistence
@@ -291,3 +293,39 @@ async def test_cancelled_end_state_has_no_error_fields(printer):
     assert entry["error_code"] is None
     assert entry["error_message"] is None
     assert entry["initiated_by"] == "spooler"
+
+
+# ── last_seen (T4) ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_broadcast_state_marks_last_seen_while_connected(printer):
+    assert printer.last_seen is None
+    _set_status(printer, 0)
+    await printer._broadcast_state()
+    assert printer.last_seen is not None
+    assert printer.last_seen <= time.time()
+
+
+@pytest.mark.asyncio
+async def test_broadcast_state_does_not_mark_last_seen_when_disconnected(printer):
+    printer.connected = False
+    _set_status(printer, 0)
+    await printer._broadcast_state()
+    assert printer.last_seen is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_does_not_refresh_a_previous_last_seen(printer):
+    _set_status(printer, 2)
+    await printer._broadcast_state()
+    first_seen = printer.last_seen
+    assert first_seen is not None
+
+    printer.connected = False
+    await printer._broadcast_state()  # simulates the disconnect notification broadcast
+    assert printer.last_seen == first_seen  # not bumped by the disconnect itself
+
+
+def test_to_dict_exposes_last_seen(printer):
+    printer.last_seen = 12345.0
+    assert printer.to_dict()["last_seen"] == 12345.0

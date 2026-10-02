@@ -74,6 +74,23 @@ header {
   z-index: 100;
 }
 
+.conn-banner {
+  position: sticky;
+  top: 60px;
+  z-index: 99;
+  background: var(--red);
+  color: #fff;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 12px;
+}
+.conn-banner[hidden] { display: none; }
+
+/* Dim all printer cards while the browser<->Spooler connection is down --
+   the data on screen is frozen at whatever it last was, not live. */
+.ws-disconnected .printer-card { opacity: .45; pointer-events: none; }
+
 .logo {
   display: flex;
   align-items: center;
@@ -292,6 +309,19 @@ main {
   font-size: 13px;
 }
 .camera-placeholder svg { width: 40px; height: 40px; opacity: .3; }
+
+.camera-stale-overlay {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  right: 8px;
+  background: rgba(0,0,0,.7);
+  color: #fff;
+  font-size: 12px;
+  text-align: center;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+}
 
 /* Print Progress */
 .card-progress-wrap {
@@ -520,6 +550,16 @@ main {
 }
 .reason-box-main strong { color: var(--text); }
 .reason-box-code { margin-top: 2px; opacity: .7; font-size: 11px; }
+
+/* Stale-data indicator (T4) — the printer is still connected, but we haven't
+   heard anything fresh from it in a while, so temps/progress may be frozen. */
+.stale-notice {
+  margin: 0 16px 12px;
+  font-size: 11px;
+  color: var(--yellow);
+}
+.card-stale .temp-block,
+.card-stale .card-progress-wrap { opacity: .5; }
 
 /* ─── Modal ───────────────────────────────────────────────────────────────── */
 .modal {
