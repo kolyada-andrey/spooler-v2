@@ -78,6 +78,10 @@ FIELDS: dict = {
     "slicer.url": Field(
         key="slicer.url", label="Slicer URL", type="url", default="", schemes=("http", "https"),
     ),
+    "backup.interval_days": Field(
+        key="backup.interval_days", label="Automatic backup interval (days)", type="int",
+        env="SPOOLER_BACKUP_INTERVAL_DAYS", default=1,
+    ),
 }
 
 _on_change: list = []  # list of (prefix, callback(key, value))
@@ -172,9 +176,12 @@ def _validate(field: Field, value):
         return str(value).lower() in ("1", "true", "yes")
     if field.type == "int":
         try:
-            return int(value)
+            parsed_int = int(value)
         except (TypeError, ValueError):
             raise ConfigError(f"{field.label}: must be a number.")
+        if parsed_int < 0:
+            raise ConfigError(f"{field.label}: cannot be negative.")
+        return parsed_int
     return str(value)
 
 

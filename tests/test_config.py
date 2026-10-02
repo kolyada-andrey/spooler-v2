@@ -58,6 +58,27 @@ def test_bool_field_set_accepts_native_bool():
     assert get("spoolman.proxy") is False
 
 
+def test_int_field_default_and_env(monkeypatch):
+    assert get("backup.interval_days") == 1
+    monkeypatch.setenv("SPOOLER_BACKUP_INTERVAL_DAYS", "3")
+    assert get("backup.interval_days") == 3
+
+
+def test_int_field_rejects_negative():
+    with pytest.raises(ConfigError, match="cannot be negative"):
+        config_set("backup.interval_days", -1)
+
+
+def test_int_field_rejects_non_numeric():
+    with pytest.raises(ConfigError, match="must be a number"):
+        config_set("backup.interval_days", "not-a-number")
+
+
+def test_int_field_zero_is_allowed():
+    config_set("backup.interval_days", 0)
+    assert get("backup.interval_days") == 0
+
+
 def test_values_persist_to_disk():
     config_set("spoolman.url", "http://10.0.0.5:7912")
     assert json.loads(config.INTEGRATIONS_FILE.read_text())["spoolman.url"] == "http://10.0.0.5:7912"

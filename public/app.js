@@ -1093,11 +1093,44 @@ async function _renderAutoBackupList() {
   }
 }
 
-document.getElementById("btn-settings-goto-backup")?.addEventListener("click", () => {
+function _populateBackupIntervalField() {
+  const input = document.getElementById("backup-interval-days");
+  if (!input) return;
+  const field = integrations.fields.find(f => f.key === "backup.interval_days");
+  input.value = field ? field.value : 1;
+}
+
+document.getElementById("btn-settings-goto-backup")?.addEventListener("click", async () => {
   _showSettingsPage(_settingsBackupPage);
   _renderAutoBackupList();
+  await loadIntegrations();
+  _populateBackupIntervalField();
 });
 document.getElementById("btn-settings-back-backup")?.addEventListener("click", _backToSettingsMenu);
+
+document.getElementById("btn-backup-interval-save")?.addEventListener("click", async () => {
+  const input = document.getElementById("backup-interval-days");
+  const days = parseInt(input.value, 10);
+  if (isNaN(days) || days < 0) {
+    toast("Enter a number of days (0 or more)", true);
+    return;
+  }
+  try {
+    const r = await fetch("/api/integrations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values: { "backup.interval_days": days } }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      toast(data.error || "Could not save interval", true);
+      return;
+    }
+    toast(days === 0 ? "Automatic backups disabled" : `Interval set to ${days} day(s)`);
+  } catch (e) {
+    toast("Could not save interval: " + e.message, true);
+  }
+});
 
 document.getElementById("btn-settings-goto-features")?.addEventListener("click", () => {
   _showSettingsPage(_settingsFeaturesPage);

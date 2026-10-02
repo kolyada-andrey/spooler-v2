@@ -22,6 +22,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import config
 from features import is_enabled
 from persistence import DATA_DIR, _atomic_write, current_version
 
@@ -248,12 +249,18 @@ def make_automatic_backup(prefix: str) -> Path | None:
 
 # ── Automatic backup scheduling ──────────────────────────────────────────────
 #
-# No settings UI exists yet (T7/T8), so these follow the same pattern as every
-# other current toggle in this project (AUTH_ENABLED, PROXY_SPOOLMAN, etc.):
-# an environment variable with a sensible default.
-AUTO_BACKUP_KEEP  = int(os.getenv("SPOOLER_BACKUP_KEEP", "7"))
-AUTO_BACKUP_DAILY = os.getenv("SPOOLER_AUTO_BACKUP_DAILY", "true").lower() not in ("0", "false", "no")
-DAILY_BACKUP_INTERVAL_S = 24 * 3600
+# Retention count has no settings-UI field yet, so it follows the same
+# pattern as every other current env-var-only toggle in this project
+# (AUTH_ENABLED, etc.). The interval IS user-configurable, via
+# config.py's "backup.interval_days" (Settings -> Backup) -- 0 disables it.
+AUTO_BACKUP_KEEP = int(os.getenv("SPOOLER_BACKUP_KEEP", "7"))
+
+
+def backup_interval_seconds() -> int:
+    # Read live (not a module constant) so a change in Settings -> Backup
+    # takes effect on the next hourly check, no restart needed.
+    return config.get("backup.interval_days") * 24 * 3600
+
 
 _VERSION_MARKER = DATA_DIR / ".last_version"
 _DAILY_MARKER   = DATA_DIR / ".last_daily_backup"
@@ -287,16 +294,18 @@ def check_startup_backup() -> None:
 
 
 def maybe_daily_backup() -> None:
-    # Checked every call (not just once) so toggling "backup" off in Settings
-    # -> Features stops future automatic backups immediately, no restart needed.
-    if not AUTO_BACKUP_DAILY or not is_enabled("backup"):
+    # Both checked every call (not just once) so toggling "backup" off, or
+    # changing the interval, in Settings takes effect immediately -- no
+    # restart needed.
+    interval_s = backup_interval_seconds()
+    if interval_s <= 0 or not is_enabled("backup"):
         return
     now = time.time()
     try:
         last = float(_DAILY_MARKER.read_text().strip())
     except (FileNotFoundError, ValueError):
         last = 0.0
-    if now - last < DAILY_BACKUP_INTERVAL_S:
+    if now - last < interval_s:
         return
     if make_automatic_backup("daily"):
         cleanup_old_backups(AUTO_BACKUP_KEEP)

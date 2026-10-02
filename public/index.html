@@ -11,7 +11,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="Spooler" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <link rel="stylesheet" href="style.css?v=33" />
+  <link rel="stylesheet" href="style.css?v=34" />
 </head>
 <body>
   <header>
@@ -613,7 +613,12 @@
 
         <div class="backup-section">
           <h4>Automatic backups</h4>
-          <p class="backup-desc">Taken daily and before version upgrades. Last 7 are kept.</p>
+          <p class="backup-desc">Also always taken before version upgrades. Last 7 are kept.</p>
+          <label class="backup-interval-row">
+            <span>Interval (days, 0 to disable)</span>
+            <input type="number" id="backup-interval-days" min="0" step="1" style="width:70px" />
+          </label>
+          <button id="btn-backup-interval-save" class="btn btn-secondary btn-sm">Save interval</button>
           <div id="backup-auto-list" class="backup-auto-list"></div>
         </div>
       </div>
@@ -684,7 +689,7 @@
 
   <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
   <script src="/config.js"></script>
-  <script src="app.js?v=47"></script>
+  <script src="app.js?v=48"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").catch(() => {});

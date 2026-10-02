@@ -7,6 +7,7 @@ import zipfile
 import pytest
 
 import backup
+import config
 import features
 import persistence
 
@@ -229,23 +230,32 @@ def test_check_startup_backup_no_backup_when_version_unchanged():
     assert list(backup.BACKUP_DIR.glob("pre-upgrade-*.zip")) == []
 
 
-def test_maybe_daily_backup_runs_when_no_marker(monkeypatch):
-    monkeypatch.setattr(backup, "AUTO_BACKUP_DAILY", True)
-    backup.maybe_daily_backup()
+def test_maybe_daily_backup_runs_when_no_marker():
+    backup.maybe_daily_backup()  # default interval is 1 day, no marker yet
     assert len(list(backup.BACKUP_DIR.glob("daily-*.zip"))) == 1
 
 
-def test_maybe_daily_backup_skips_when_recent(monkeypatch):
-    monkeypatch.setattr(backup, "AUTO_BACKUP_DAILY", True)
+def test_maybe_daily_backup_skips_when_recent():
     backup._DAILY_MARKER.write_text(str(time.time()))
     backup.maybe_daily_backup()
     assert list(backup.BACKUP_DIR.glob("daily-*.zip")) == []
 
 
-def test_maybe_daily_backup_respects_disabled_flag(monkeypatch):
-    monkeypatch.setattr(backup, "AUTO_BACKUP_DAILY", False)
+def test_maybe_daily_backup_respects_interval_disabled_via_config():
+    config.set("backup.interval_days", 0)
     backup.maybe_daily_backup()
     assert list(backup.BACKUP_DIR.glob("daily-*.zip")) == []
+
+
+def test_maybe_daily_backup_respects_custom_interval():
+    config.set("backup.interval_days", 3)
+    backup._DAILY_MARKER.write_text(str(time.time() - 2 * 24 * 3600))  # 2 days ago
+    backup.maybe_daily_backup()
+    assert list(backup.BACKUP_DIR.glob("daily-*.zip")) == []  # not due yet (needs 3)
+
+    backup._DAILY_MARKER.write_text(str(time.time() - 4 * 24 * 3600))  # 4 days ago
+    backup.maybe_daily_backup()
+    assert len(list(backup.BACKUP_DIR.glob("daily-*.zip"))) == 1  # now it's due
 
 
 def test_list_auto_backups_reports_name_size_modified():
@@ -273,8 +283,7 @@ def test_check_startup_backup_skipped_when_feature_off():
     assert backup._VERSION_MARKER.read_text().strip() == "0.0.1"
 
 
-def test_maybe_daily_backup_skipped_when_feature_off(monkeypatch):
-    monkeypatch.setattr(backup, "AUTO_BACKUP_DAILY", True)
+def test_maybe_daily_backup_skipped_when_feature_off():
     features.set_enabled("backup", False)
     backup.maybe_daily_backup()
     assert list(backup.BACKUP_DIR.glob("daily-*.zip")) == []

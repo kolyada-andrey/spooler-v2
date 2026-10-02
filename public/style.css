@@ -1329,6 +1329,10 @@ main {
 }
 .backup-checkbox-row input { margin-top: 2px; flex-shrink: 0; }
 #backup-restore-file { display: block; margin-bottom: 10px; font-size: 12px; }
+.backup-interval-row {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12px; color: var(--text-muted); margin-bottom: 10px;
+}
 .backup-auto-list { display: flex; flex-direction: column; gap: 6px; }
 .backup-auto-row {
   display: flex; align-items: center; justify-content: space-between;
