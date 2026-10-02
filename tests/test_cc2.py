@@ -58,6 +58,14 @@ def test_protocol_reason_hint_resolves_known_error_code(printer):
     assert hint["message"] == "Leveling failed. Please try again."
 
 
+def test_apply_cc2_status_maps_bed_preheating_sub_status_1906(printer):
+    # Verified against Elegoo's own elegoo-link SDK -- 1906 was missing from
+    # our sub_status table even though 1405/1096 (also preheating) were there.
+    printer._cc2_state["machine_status"] = {"sub_status": 1906}
+    printer._apply_cc2_status()
+    assert printer.status["PrintInfo"]["Status"] == 15
+
+
 @pytest.mark.asyncio
 async def test_error_code_captured_from_api_response_poll_path(printer):
     # Simulates the 5s status poller's method 1003 response, which goes

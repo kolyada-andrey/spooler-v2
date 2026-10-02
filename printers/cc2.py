@@ -466,9 +466,13 @@ class CC2Connection(PrinterConnection):
             self._current_filename = filename_from_ps
         sub_status     = ms.get("sub_status", 0)
 
+        # sub_status numbers verified against Elegoo's own open-source network SDK
+        # (github.com/elegooofficial/elegoo-link,
+        # src/lan/adapters/elegoo_fdm_cc2/elegoo_fdm_cc2_message_adapter.cpp's
+        # machine_status.sub_status switch) -- not guessed.
         _SUB_TRANSIENT = {2501: 5, 2503: 7}
         _SUB_STABLE    = {
-            1045: 15, 1096: 15, 1405: 15,
+            1045: 15, 1096: 15, 1405: 15, 1906: 15,  # extruder/bed preheating
             2075: 3,  2401: 3,  2402: 3,
             2077: 9,
             2502: 6,  2505: 6,
