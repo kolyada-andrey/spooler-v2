@@ -664,6 +664,7 @@ function renderPrinter(printer) {
         prevCameraImg.src = cameraUrl;
       }
       prevCameraImg._connected = connected;
+      prevCameraImg._baseUrl = cameraUrl;
       cameraDiv.insertBefore(prevCameraImg, cameraDiv.firstChild);
       placeholder.style.display = 'none';
       prevCameraImg.style.display = '';
@@ -672,6 +673,7 @@ function renderPrinter(printer) {
       img.src = cameraUrl;
       img.alt = 'Camera feed';
       img._connected = connected;
+      img._baseUrl = cameraUrl;
       // Chrome/Chromium does not reliably re-fire "load" for each part of a
       // multipart/x-mixed-replace MJPEG stream (only Firefox does), so load
       // timing can't be used as a per-frame staleness signal across browsers
@@ -2537,6 +2539,21 @@ function renderDemoStates() {
     renderPrinter(p);
   });
 }
+
+// Mobile browsers (notably when installed as a PWA) suspend the network
+// connection behind an MJPEG <img> while the app is backgrounded, and the
+// stream doesn't resume on its own since the <img> src never changes -- it
+// hangs showing the last frame (or the alt text) until something forces a
+// fresh request. Re-point every camera <img> at a cache-busted URL whenever
+// the app comes back to the foreground to force that reconnect.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  document.querySelectorAll('.card-camera img').forEach(img => {
+    if (!img._baseUrl) return;
+    const sep = img._baseUrl.includes('?') ? '&' : '?';
+    img.src = `${img._baseUrl}${sep}_r=${Date.now()}`;
+  });
+});
 
 // ─── Boot ──────────────────────────────────────────────────────────────────────
 if (new URLSearchParams(location.search).get("demo") === "states") {
