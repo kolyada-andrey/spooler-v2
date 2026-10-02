@@ -662,7 +662,6 @@ function renderPrinter(printer) {
       // to force reconnect (avoids stale broken stream from a prior disconnect)
       if (!prevCameraImg._connected && connected) {
         prevCameraImg.src = cameraUrl;
-        prevCameraImg._lastFrameAt = Date.now();
       }
       prevCameraImg._connected = connected;
       cameraDiv.insertBefore(prevCameraImg, cameraDiv.firstChild);
@@ -673,28 +672,16 @@ function renderPrinter(printer) {
       img.src = cameraUrl;
       img.alt = 'Camera feed';
       img._connected = connected;
-      img._lastFrameAt = Date.now();
-      // Each MJPEG part (multipart/x-mixed-replace) re-fires "load" as it
-      // replaces the displayed frame, so time-since-last-load is a reliable
-      // signal the stream actually stopped producing new frames, not just
-      // that the initial connection succeeded once.
-      img.addEventListener('load',  () => { placeholder.style.display = 'none'; img._lastFrameAt = Date.now(); });
+      // Chrome/Chromium does not reliably re-fire "load" for each part of a
+      // multipart/x-mixed-replace MJPEG stream (only Firefox does), so load
+      // timing can't be used as a per-frame staleness signal across browsers
+      // -- it caused "Camera image not updated" to fire constantly on Chrome
+      // even while the stream was actively working. The "error" event still
+      // fires correctly when the stream genuinely drops, so that's all we
+      // rely on here.
+      img.addEventListener('load',  () => { placeholder.style.display = 'none'; });
       img.addEventListener('error', () => { img.style.display = 'none'; placeholder.style.display = 'flex'; });
       cameraDiv.insertBefore(img, cameraDiv.firstChild);
-    }
-    const liveImg = cameraDiv.querySelector('img');
-    const stalledFrame = liveImg && liveImg.style.display !== 'none'
-      && (Date.now() - (liveImg._lastFrameAt || 0)) > 10000;
-    let overlay = cameraDiv.querySelector('.camera-stale-overlay');
-    if (stalledFrame) {
-      if (!overlay) {
-        overlay = document.createElement('div');
-        overlay.className = 'camera-stale-overlay';
-        overlay.textContent = 'Camera image not updated';
-        cameraDiv.appendChild(overlay);
-      }
-    } else if (overlay) {
-      overlay.remove();
     }
   }
 }
