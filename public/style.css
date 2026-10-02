@@ -1353,6 +1353,46 @@ main {
 .feature-desc  { font-size: 11px; color: var(--text-muted); }
 .feature-locked-note { font-size: 11px; color: var(--yellow); }
 
+/* ─── Integrations config (T8) ────────────────────────────────────────────── */
+.integrations-warning {
+  font-size: 12px; color: var(--yellow);
+  background: rgba(234,179,8,.1); border-radius: var(--radius-sm);
+  padding: 8px 10px; margin-bottom: 14px;
+}
+.integration-group {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  margin-bottom: 10px; overflow: hidden;
+}
+.integration-group summary {
+  padding: 10px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
+  background: var(--surface2);
+}
+.integration-group-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 12px; }
+.integration-field label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; color: var(--text-muted);
+}
+.integration-field input { font-size: 13px; }
+.integration-field-meta {
+  display: flex; align-items: center; gap: 8px; margin-top: 2px; font-size: 11px;
+}
+.integration-source-badge {
+  background: var(--surface2); color: var(--text-muted);
+  padding: 1px 6px; border-radius: 99px;
+}
+.integration-locked-note { color: var(--yellow); font-size: 11px; }
+.integration-test-row { display: flex; align-items: center; gap: 10px; }
+.integration-test-result { font-size: 12px; }
+.integration-test-result.ok   { color: var(--green); }
+.integration-test-result.fail { color: var(--red); }
+.integrations-server-settings { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--border); }
+.integrations-server-settings h4 { font-size: 13px; margin-bottom: 8px; color: var(--text-muted); }
+.integrations-server-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px;
+  font-size: 12px; color: var(--text-muted);
+}
+.integrations-server-grid b { color: var(--text); font-weight: 500; }
+
 /* ─── Notification settings ───────────────────────────────────────────────── */
 .notif-list { display: flex; flex-direction: column; gap: 0; margin: 16px 0 24px; }
 .notif-row {

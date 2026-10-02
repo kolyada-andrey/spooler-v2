@@ -176,6 +176,14 @@ Spooler integrates with **[Spoolman](https://github.com/Donkie/Spoolman)**, an o
 
 By default, Spooler proxies the Spoolman UI through itself (so one port covers everything). To redirect the browser directly to Spoolman instead — useful if you run a separate reverse proxy or need better WebSocket support — set `PROXY_SPOOLMAN=false` in your `.env` file.
 
+### Configuring the connection
+
+Settings → **Integrations** lets you change the Spoolman URL, the proxy toggle, and an optional basic-auth username/password (for a Spoolman sitting behind a reverse proxy that requires it) — all without touching `.env` or restarting. **Test connection** checks it immediately. Values set via `.env` still work as the default if nothing's been changed in the UI; set `SPOOLER_LOCK_CONFIG=1` to make environment variables win unconditionally and the fields read-only (for someone hosting Spooler for other people).
+
+The same page also has a **Slicer** field — paste the URL of a browser-based slicer (e.g. a self-hosted [Orca Slicer](https://github.com/linuxserver/docker-orcaslicer)) and a **Slicer** link appears in the sidebar that opens it in a new tab.
+
+**Note:** integration values (including the optional Spoolman password) are stored unencrypted in `DATA_DIR/integrations.json`. Make sure that directory isn't readable by anyone you don't trust.
+
 ---
 
 ## Protocol

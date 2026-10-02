@@ -34,7 +34,8 @@ from push import (
     WEBPUSH_AVAILABLE, add_subscription, get_public_key, has_subscriptions,
     load_notif_settings, remove_subscription, save_notif_settings, send_push_all,
 )
-from spoolman import get_spoolman_db, get_spoolman_url
+from spoolman import get_spoolman_db, get_spoolman_url, spoolman_auth_header, test_spoolman_connection
+import config
 
 try:
     import bcrypt as _bcrypt
@@ -48,9 +49,26 @@ MAX_BODY = 100 * 1024 * 1024  # 100 MB
 
 _current_version = current_version  # kept as a module-local alias; call sites unchanged
 
-# When true, Spoolman's web UI is proxied through /spoolman/ on this server.
-# When false (default), /spoolman redirects the browser directly to SPOOLMAN_URL.
-PROXY_SPOOLMAN = os.getenv("PROXY_SPOOLMAN", "true").lower() in ("1", "true", "yes")
+def proxy_spoolman_enabled() -> bool:
+    # Read live (not a module constant) so a change in Settings -> Integrations
+    # takes effect immediately -- every call site below already calls this
+    # function rather than checking a cached value.
+    return config.get("spoolman.proxy")
+
+
+def _server_settings_readonly() -> dict:
+    """Server network/auth settings -- deliberately never editable from the
+    UI (a wrong value here could lock the user out), shown read-only in
+    Settings -> Integrations alongside the fields that ARE editable there."""
+    return {
+        "HTTP_PORT":     os.getenv("HTTP_PORT", "8080"),
+        "HTTPS_PORT":    os.getenv("HTTPS_PORT", "8443"),
+        "WS_PORT":       os.getenv("WS_PORT", "8765"),
+        "WSS_PORT":      os.getenv("WSS_PORT", "8766"),
+        "HTTPS_ENABLED": os.getenv("HTTPS_ENABLED", "true"),
+        "AUTH_ENABLED":  os.getenv("AUTH_ENABLED", "true"),
+        "DATA_DIR":      str(DATA_DIR),
+    }
 
 
 def ensure_ssl_cert() -> bool:
@@ -338,10 +356,13 @@ class SPHandler(SimpleHTTPRequestHandler):
             self._json({"error": "Invalid Spoolman path"}, 400)
             return
         try:
+            headers = spoolman_auth_header()
+            if body:
+                headers["Content-Type"] = "application/json"
             req = urllib.request.Request(
                 f"{get_spoolman_url()}{path}",
                 data=body,
-                headers={"Content-Type": "application/json"} if body else {},
+                headers=headers,
                 method=method,
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -371,7 +392,9 @@ class SPHandler(SimpleHTTPRequestHandler):
         /spoolman/ prefix (required because Spoolman uses paths like /assets/...).
         """
         try:
-            headers = {"Content-Type": "application/json"} if body else {}
+            headers = spoolman_auth_header()
+            if body:
+                headers["Content-Type"] = "application/json"
             req = urllib.request.Request(
                 f"{get_spoolman_url()}{sm_path}",
                 data=body,
@@ -508,7 +531,7 @@ class SPHandler(SimpleHTTPRequestHandler):
             return
         # Spoolman — either proxy through our server or redirect directly to it
         if self.path in ("/spoolman", "/spoolman/"):
-            if PROXY_SPOOLMAN:
+            if proxy_spoolman_enabled():
                 if self.path == "/spoolman":
                     self.send_response(302)
                     self.send_header("Location", "/spoolman/")
@@ -520,18 +543,18 @@ class SPHandler(SimpleHTTPRequestHandler):
                 self.send_header("Location", get_spoolman_url() + "/")
                 self.end_headers()
             return
-        if PROXY_SPOOLMAN and self.path.startswith("/spoolman/"):
+        if proxy_spoolman_enabled() and self.path.startswith("/spoolman/"):
             sm_path = self.path[len("/spoolman"):]
             self._proxy_spoolman_ui("GET", sm_path or "/")
             return
         # Spoolman's own JS calls /api/v1/ directly — only proxy when enabled
-        if PROXY_SPOOLMAN and self.path.startswith("/api/v1/"):
+        if proxy_spoolman_enabled() and self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("GET", self.path)
             return
         if self.path == "/api/auth-status":
             resp = {"setup_required": not _has_password()}
             if _auth_ok(self):
-                resp["spoolman_url"] = "/spoolman/" if PROXY_SPOOLMAN else get_spoolman_url() + "/"
+                resp["spoolman_url"] = "/spoolman/" if proxy_spoolman_enabled() else get_spoolman_url() + "/"
             self._json(resp)
             return
 
@@ -579,6 +602,12 @@ class SPHandler(SimpleHTTPRequestHandler):
 
         if self.path == "/api/features":
             self._json(describe_all_features())
+        elif self.path == "/api/integrations":
+            self._json({
+                "fields": config.describe_all(),
+                "tests": {"spoolman": config.last_test_result("spoolman")},
+                "server_settings": _server_settings_readonly(),
+            })
         elif self.path.startswith("/api/camera/"):
             self._proxy_camera()
         elif self.path.startswith("/api/thumbnail/"):
@@ -626,7 +655,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/spoolman"):
             self._proxy_spoolman("GET", self.path[len("/api/spoolman"):], None)
         elif (
-            PROXY_SPOOLMAN
+            proxy_spoolman_enabled()
             and "text/html" in self.headers.get("Accept", "")
             and self.path not in ("/", "")
             and not Path(self.path.split("?")[0]).suffix
@@ -641,7 +670,7 @@ class SPHandler(SimpleHTTPRequestHandler):
             local = Path(__file__).parent / "public" / path_part
             if local.is_file():
                 super().do_GET()
-            elif PROXY_SPOOLMAN and Path(path_part).suffix:
+            elif proxy_spoolman_enabled() and Path(path_part).suffix:
                 self._proxy_spoolman_ui("GET", self.path.split("?")[0])
             else:
                 super().do_GET()
@@ -652,7 +681,10 @@ class SPHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/features":
             self._handle_patch_features()
             return
-        if PROXY_SPOOLMAN and self.path.startswith("/api/v1/"):
+        if self.path == "/api/integrations":
+            self._handle_patch_integrations()
+            return
+        if proxy_spoolman_enabled() and self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("PATCH", self.path, self._read_body())
             return
         if self.path.startswith("/api/spoolman"):
@@ -663,7 +695,7 @@ class SPHandler(SimpleHTTPRequestHandler):
     def do_DELETE(self):
         if not self._check_auth():
             return
-        if PROXY_SPOOLMAN and self.path.startswith("/api/v1/"):
+        if proxy_spoolman_enabled() and self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("DELETE", self.path)
             return
         if self.path.startswith("/api/spoolman"):
@@ -698,6 +730,8 @@ class SPHandler(SimpleHTTPRequestHandler):
             self._handle_push_test()
         elif self.path == "/api/import-filaments":
             self._handle_import_filaments()
+        elif self.path == "/api/integrations/spoolman/test":
+            self._handle_test_spoolman()
         elif self.path == "/api/restore":
             self._handle_restore()
         elif self.path.startswith("/api/v1/"):
@@ -973,6 +1007,50 @@ class SPHandler(SimpleHTTPRequestHandler):
                 state.broadcast_to_browsers({"type": "features_changed", "features": features}),
                 _ws_loop,
             )
+
+    # ── Integrations config ──────────────────────────────────────────────────
+
+    def _handle_patch_integrations(self):
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except Exception:
+            self._json({"error": "Bad request"}, 400)
+            return
+        values = body.get("values", {})
+        clear_keys = body.get("clear", [])
+        if not isinstance(values, dict) or not isinstance(clear_keys, list):
+            self._json({"error": 'Expected {"values": {...}, "clear": [...]}'}, 400)
+            return
+
+        errors = {}
+        for key, value in values.items():
+            field = config.FIELDS.get(key)
+            if field is None:
+                errors[key] = "Unknown field"
+                continue
+            if field.type == "secret" and value == "":
+                continue  # blank secret field on save means "leave unchanged"
+            try:
+                config.set(key, value)
+            except config.ConfigError as e:
+                errors[key] = str(e)
+        for key in clear_keys:
+            try:
+                config.clear(key)
+            except config.ConfigError as e:
+                errors[key] = str(e)
+
+        if errors:
+            self._json({"error": "Some fields could not be updated", "fields": errors}, 400)
+            return
+        self._json({"ok": True, "fields": config.describe_all()})
+
+    @requires_feature("spoolman")
+    def _handle_test_spoolman(self):
+        self._read_body()
+        result = test_spoolman_connection()
+        config.record_test_result("spoolman", result["ok"], result["message"])
+        self._json(result)
 
     # ── Response helper ───────────────────────────────────────────────────────
 

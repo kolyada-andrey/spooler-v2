@@ -8,6 +8,7 @@ gets its persistence files redirected into a fresh tmp_path automatically.
 import pytest
 
 import backup
+import config
 import features
 import persistence
 
@@ -37,4 +38,8 @@ def isolated_data_dir(tmp_path, monkeypatch):
     # force-disable set via monkeypatch) in one test would leak into the next.
     monkeypatch.setattr(features, "_FORCE_DISABLED", set())
     monkeypatch.setattr(features, "_on_change_callbacks", {})
+    monkeypatch.setattr(config, "INTEGRATIONS_FILE", tmp_path / "integrations.json")
+    monkeypatch.setattr(config, "LOCK_CONFIG", False)
+    monkeypatch.setattr(config, "_on_change", [])
+    monkeypatch.setattr(config, "_last_test_results", {})
     yield tmp_path

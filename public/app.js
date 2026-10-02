@@ -795,8 +795,9 @@ const _settingsPrintersPage   = document.getElementById("settings-printers");
 const _settingsPrinterEditPage = document.getElementById("settings-printer-edit");
 const _settingsBackupPage     = document.getElementById("settings-backup");
 const _settingsFeaturesPage   = document.getElementById("settings-features");
+const _settingsIntegrationsPage = document.getElementById("settings-integrations");
 
-const _allSettingsPages = () => [_settingsPwPage, _settingsNotifPage, _settingsPrintersPage, _settingsPrinterEditPage, _settingsBackupPage, _settingsFeaturesPage];
+const _allSettingsPages = () => [_settingsPwPage, _settingsNotifPage, _settingsPrintersPage, _settingsPrinterEditPage, _settingsBackupPage, _settingsFeaturesPage, _settingsIntegrationsPage];
 
 function _openSettings() {
   _allSettingsPages().forEach(p => p && (p.style.display = "none"));
@@ -1103,6 +1104,13 @@ document.getElementById("btn-settings-goto-features")?.addEventListener("click",
   _renderFeaturesList();
 });
 document.getElementById("btn-settings-back-features")?.addEventListener("click", _backToSettingsMenu);
+
+document.getElementById("btn-settings-goto-integrations")?.addEventListener("click", () => {
+  _showSettingsPage(_settingsIntegrationsPage);
+  _renderIntegrationsList();
+  _renderServerSettings();
+});
+document.getElementById("btn-settings-back-integrations")?.addEventListener("click", _backToSettingsMenu);
 
 document.getElementById("btn-backup-download")?.addEventListener("click", () => {
   const includeSecrets = document.getElementById("backup-include-secrets")?.checked;
@@ -1583,6 +1591,169 @@ async function loadFeatures() {
     if (r.ok) _applyFeatures(await r.json());
   } catch (e) { /* server may not be ready yet */ }
 }
+
+// ─── Integrations config (T8) ────────────────────────────────────────────────
+let integrations = { fields: [], tests: {}, server_settings: {} };
+
+function integrationField(key) {
+  return integrations.fields.find(f => f.key === key);
+}
+
+async function loadIntegrations() {
+  try {
+    const r = await fetch("/api/integrations");
+    if (!r.ok) return;
+    integrations = await r.json();
+    const slicerUrl = integrationField("slicer.url")?.value || "";
+    const slicerBtn = document.getElementById("btn-slicer");
+    if (slicerBtn) {
+      slicerBtn.hidden = !slicerUrl;
+      if (slicerUrl) slicerBtn.href = slicerUrl;
+    }
+    if (_settingsIntegrationsPage && _settingsIntegrationsPage.style.display !== "none") {
+      _renderIntegrationsList();
+    }
+  } catch (e) { /* server may not be ready yet */ }
+}
+
+const _INTEGRATION_GROUPS = [
+  { title: "Spoolman", prefix: "spoolman.", testKey: "spoolman" },
+  { title: "Slicer",   prefix: "slicer.",   testKey: null },
+];
+
+function _renderIntegrationsList() {
+  const container = document.getElementById("integrations-list");
+  if (!container) return;
+
+  container.innerHTML = _INTEGRATION_GROUPS.map(group => {
+    const fields = integrations.fields.filter(f => f.key.startsWith(group.prefix));
+    if (!fields.length) return "";
+    const test = group.testKey ? integrations.tests[group.testKey] : null;
+
+    const fieldsHtml = fields.map(f => {
+      const sourceLabel = f.source === "env" ? "from environment variable"
+                         : f.source === "ui"  ? "custom"
+                         : "default";
+      const lockedNote = f.locked
+        ? `<div class="integration-locked-note">Locked by server configuration</div>` : "";
+
+      if (f.type === "bool") {
+        return `
+          <div class="integration-field">
+            <div style="display:flex;align-items:center;gap:10px;justify-content:space-between">
+              <span>${escHtml(f.label)}</span>
+              <label class="toggle-switch">
+                <input type="checkbox" data-config-key="${escAttr(f.key)}"
+                       ${f.value ? "checked" : ""} ${f.locked ? "disabled" : ""} />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="integration-field-meta"><span class="integration-source-badge">${escHtml(sourceLabel)}</span></div>
+            ${lockedNote}
+          </div>`;
+      }
+
+      const inputType = f.type === "secret" ? "password" : f.type === "int" ? "number" : "text";
+      const placeholder = f.type === "secret" ? (f.set ? "•••• (leave blank to keep)" : "Not set") : "";
+      const value = f.type === "secret" ? "" : escAttr(f.value ?? "");
+      const removeBtn = (f.type === "secret" && f.set)
+        ? `<button type="button" class="btn btn-secondary btn-sm" data-clear-key="${escAttr(f.key)}">Remove</button>` : "";
+      return `
+        <div class="integration-field">
+          <label>${escHtml(f.label)}
+            <input type="${inputType}" data-config-key="${escAttr(f.key)}" value="${value}"
+                   placeholder="${escAttr(placeholder)}" ${f.locked ? "disabled" : ""} />
+          </label>
+          <div class="integration-field-meta">
+            <span class="integration-source-badge">${escHtml(sourceLabel)}</span>
+            ${removeBtn}
+          </div>
+          ${lockedNote}
+        </div>`;
+    }).join("");
+
+    const testHtml = group.testKey ? `
+      <div class="integration-test-row">
+        <button type="button" class="btn btn-secondary btn-sm" data-test-key="${escAttr(group.testKey)}">Test connection</button>
+        ${test ? `<span class="integration-test-result ${test.ok ? "ok" : "fail"}">${escHtml(test.message)}</span>` : ""}
+      </div>` : "";
+
+    return `
+      <details class="integration-group" open>
+        <summary>${escHtml(group.title)}</summary>
+        <div class="integration-group-body">${fieldsHtml}${testHtml}</div>
+      </details>`;
+  }).join("");
+
+  container.querySelectorAll("button[data-test-key]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const key = btn.dataset.testKey;
+      btn.disabled = true;
+      btn.textContent = "Testing…";
+      try {
+        const r = await fetch(`/api/integrations/${encodeURIComponent(key)}/test`, { method: "POST" });
+        integrations.tests[key] = await r.json();
+      } catch (e) {
+        integrations.tests[key] = { ok: false, message: e.message };
+      }
+      _renderIntegrationsList();
+    });
+  });
+
+  container.querySelectorAll("button[data-clear-key]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const key = btn.dataset.clearKey;
+      try {
+        const r = await fetch("/api/integrations", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clear: [key] }),
+        });
+        const data = await r.json();
+        if (!r.ok) { toast(data.error || "Could not clear field", true); return; }
+        integrations.fields = data.fields;
+        _renderIntegrationsList();
+        toast("Cleared");
+      } catch (e) {
+        toast("Could not clear field: " + e.message, true);
+      }
+    });
+  });
+}
+
+function _renderServerSettings() {
+  const el = document.getElementById("integrations-server-settings-list");
+  if (!el) return;
+  const s = integrations.server_settings || {};
+  el.innerHTML = Object.entries(s)
+    .map(([k, v]) => `<span>${escHtml(k)}</span><b>${escHtml(String(v))}</b>`)
+    .join("");
+}
+
+document.getElementById("btn-integrations-save")?.addEventListener("click", async () => {
+  const values = {};
+  document.querySelectorAll("#integrations-list [data-config-key]").forEach(input => {
+    const key = input.dataset.configKey;
+    values[key] = input.type === "checkbox" ? input.checked : input.value;
+  });
+  try {
+    const r = await fetch("/api/integrations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      toast(data.error || "Could not save", true);
+      return;
+    }
+    toast("Saved");
+    await loadIntegrations();
+    _renderIntegrationsList();
+  } catch (e) {
+    toast("Could not save: " + e.message, true);
+  }
+});
 
 function _applyFeatures(list) {
   features = {};
@@ -2337,6 +2508,7 @@ if (new URLSearchParams(location.search).get("demo") === "states") {
     .catch(() => {});
   loadChangelog();
   loadFeatures();
+  loadIntegrations();
   connect();
   // Staleness is purely a function of wall-clock time passing, not of new
   // data arriving — a card can go stale with no new printer_update at all,
