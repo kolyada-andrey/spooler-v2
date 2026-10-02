@@ -66,6 +66,18 @@ def test_apply_cc2_status_maps_bed_preheating_sub_status_1906(printer):
     assert printer.status["PrintInfo"]["Status"] == 15
 
 
+@pytest.mark.parametrize("sub_status,expected_code", [
+    (2801, 1),   # homing
+    (2802, 1),   # homing
+    (2901, 20),  # auto-leveling
+    (2902, 20),  # auto-leveling
+])
+def test_apply_cc2_status_maps_homing_and_leveling_sub_statuses(printer, sub_status, expected_code):
+    printer._cc2_state["machine_status"] = {"sub_status": sub_status}
+    printer._apply_cc2_status()
+    assert printer.status["PrintInfo"]["Status"] == expected_code
+
+
 @pytest.mark.asyncio
 async def test_error_code_captured_from_api_response_poll_path(printer):
     # Simulates the 5s status poller's method 1003 response, which goes

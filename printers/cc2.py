@@ -469,10 +469,19 @@ class CC2Connection(PrinterConnection):
         # sub_status numbers verified against Elegoo's own open-source network SDK
         # (github.com/elegooofficial/elegoo-link,
         # src/lan/adapters/elegoo_fdm_cc2/elegoo_fdm_cc2_message_adapter.cpp's
-        # machine_status.sub_status switch) -- not guessed.
+        # machine_status.sub_status switch) -- not guessed. That SDK observes
+        # 2801/2802 (homing) and 2901/2902 (auto-leveling) alongside its own
+        # top-level status==PRINTING, i.e. during a print's pre-print phase --
+        # we don't read that top-level status field ourselves, but placing
+        # them in _SUB_STABLE follows the exact same pattern already verified
+        # correct for the sibling preheating codes below (which only take
+        # effect when our own print_status.state string doesn't already say
+        # "printing", i.e. before the print has actually started extruding).
         _SUB_TRANSIENT = {2501: 5, 2503: 7}
         _SUB_STABLE    = {
             1045: 15, 1096: 15, 1405: 15, 1906: 15,  # extruder/bed preheating
+            2801: 1,  2802: 1,                       # homing
+            2901: 20, 2902: 20,                      # auto-leveling
             2075: 3,  2401: 3,  2402: 3,
             2077: 9,
             2502: 6,  2505: 6,
