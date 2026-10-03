@@ -99,3 +99,26 @@ async def test_error_code_captured_from_api_status_push_path(printer):
     )
     await printer._handle_mqtt_message(msg)
     assert printer._cc2_state.get("error_code") == 13
+
+
+# ── external_device.camera ───────────────────────────────────────────────────
+
+def test_camera_connected_defaults_to_unknown(printer):
+    assert printer.camera_connected is None
+
+
+def test_camera_connected_true_when_reported(printer):
+    printer._cc2_state["external_device"] = {"camera": True}
+    printer._apply_cc2_status()
+    assert printer.camera_connected is True
+
+
+def test_camera_connected_false_when_reported(printer):
+    printer._cc2_state["external_device"] = {"camera": False}
+    printer._apply_cc2_status()
+    assert printer.camera_connected is False
+
+
+def test_camera_connected_stays_unknown_without_external_device(printer):
+    printer._apply_cc2_status()
+    assert printer.camera_connected is None

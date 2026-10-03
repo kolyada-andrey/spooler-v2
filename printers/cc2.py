@@ -466,6 +466,16 @@ class CC2Connection(PrinterConnection):
             self._current_filename = filename_from_ps
         sub_status     = ms.get("sub_status", 0)
 
+        # external_device.camera -- verified against Elegoo's elegoo-link SDK
+        # (externalDeviceStatus.cameraConnected) as the printer's own signal
+        # for whether a camera module is physically connected right now.
+        # Only set when the printer has actually reported this key at least
+        # once; stays None (unknown) otherwise rather than defaulting to
+        # "disconnected" on a guess.
+        ext_device = s.get("external_device")
+        if isinstance(ext_device, dict) and "camera" in ext_device:
+            self.camera_connected = bool(ext_device["camera"])
+
         # sub_status numbers verified against Elegoo's own open-source network SDK
         # (github.com/elegooofficial/elegoo-link,
         # src/lan/adapters/elegoo_fdm_cc2/elegoo_fdm_cc2_message_adapter.cpp's

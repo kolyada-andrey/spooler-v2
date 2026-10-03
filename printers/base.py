@@ -147,6 +147,12 @@ class PrinterConnection:
         self.status: dict = {}
         self.attrs: dict  = {}
         self.camera_url: str | None = None
+        # True/False when the protocol actually reports whether a camera
+        # module is physically connected (currently CC2 only, via
+        # external_device.camera); None when the protocol doesn't report
+        # this at all, so the frontend can tell "known disconnected" apart
+        # from "unknown" instead of assuming disconnected by default.
+        self.camera_connected: bool | None = None
         self.filament_density: float = FILAMENT_DENSITY
         self._task: asyncio.Task | None = None
         self._last_print_status = None
@@ -235,6 +241,7 @@ class PrinterConnection:
             "last_seen":       self.last_seen,
             "attrs":           self.attrs,
             "camera_url":      self.camera_url,
+            "camera_connected": self.camera_connected,
             "filament_mm":     round(filament_mm, 1),
             "filament_g":      filament_mm_to_grams(filament_mm, self.filament_density),
         }

@@ -477,6 +477,7 @@ function renderPrinter(printer) {
   const lightOn    = getLightOn(printer);
 
   const cameraUrl = printer.connected && printer.camera_url && featureEnabled("camera")
+                     && printer.camera_connected !== false
     ? `/api/camera/${encodeURIComponent(printer.id)}`
     : null;
 
@@ -515,7 +516,7 @@ function renderPrinter(printer) {
           <path d="M23 7l-7 5 7 5V7z"/>
           <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
         </svg>
-        <span>${connected ? "No camera feed" : "Printer offline"}</span>
+        <span>${!connected ? "Printer offline" : printer.camera_connected === false ? "Camera not connected on printer" : "No camera feed"}</span>
       </div>
     </div>
 
