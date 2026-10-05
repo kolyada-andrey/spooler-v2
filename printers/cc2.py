@@ -60,6 +60,8 @@ _CC2_STATE_KEYS = {
     "canvas", "canvas_info", "channel_info", "channels",
     "filament", "filament_info", "extruder_filament",
     "mmu", "ams",
+    # Device attributes (method 1001 response)
+    "software_version",
 }
 
 
@@ -200,6 +202,7 @@ class CC2Connection(PrinterConnection):
                     self.connected = True
                     print(f"[Printer {self.name}] CC2 registered OK — ready")
                     await self._broadcast_state()
+                    await self.send_cmd(1001)  # device attributes (model/firmware/sn)
                     await self.send_cmd(1002)  # full state
                     await self.send_cmd(1003)  # machine_status
                     await self.send_cmd(1042)  # camera URL
@@ -305,6 +308,12 @@ class CC2Connection(PrinterConnection):
             # anywhere).
             if "error_code" in source:
                 self._cc2_state["error_code"] = source["error_code"]
+            # machine_model/sn/hostname are scalars from method 1001's response,
+            # same "not a dict so the comprehension above skips it" situation
+            # as error_code.
+            for key in ("machine_model", "sn", "hostname"):
+                if key in source:
+                    self._cc2_state[key] = source[key]
             if updates:
                 deep_merge(self._cc2_state, updates)
                 self._apply_cc2_status()
@@ -456,6 +465,21 @@ class CC2Connection(PrinterConnection):
         bed   = s.get("heater_bed", {})
         ztemp = s.get("ztemperature_sensor", {})
         ms    = s.get("machine_status", {})
+
+        # Device attributes (method 1001) -- same self.attrs shape CC1 already
+        # populates, so the existing "fw {version}" subtitle in the frontend
+        # just works for CC2 too. Verified live against real hardware
+        # (2026-10-05): software_version.ota_version is the user-facing
+        # firmware version shown on Elegoo's own app; mcu_version/soc_version
+        # exist but aren't what "firmware version" means to a user here.
+        sw_version = s.get("software_version")
+        if s.get("machine_model") or sw_version or s.get("sn") or s.get("hostname"):
+            self.attrs = {
+                "Model":           s.get("machine_model", self.attrs.get("Model", "")),
+                "FirmwareVersion": (sw_version or {}).get("ota_version", self.attrs.get("FirmwareVersion", "")),
+                "MainboardID":     s.get("sn", self.attrs.get("MainboardID", "")),
+                "Hostname":        s.get("hostname", self.attrs.get("Hostname", "")),
+            }
 
         print_duration = ps.get("print_duration", 0) or 0
         remaining      = ps.get("remaining_time_sec", 0) or 0

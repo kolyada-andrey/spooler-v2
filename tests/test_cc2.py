@@ -122,3 +122,31 @@ def test_camera_connected_false_when_reported(printer):
 def test_camera_connected_stays_unknown_without_external_device(printer):
     printer._apply_cc2_status()
     assert printer.camera_connected is None
+
+
+# ── Device attributes (method 1001) ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_device_attributes_captured_from_api_response(printer):
+    msg = _FakeMessage(
+        "elegoo/SN123/cli1/api_response",
+        {"method": 1001, "result": {
+            "machine_model": "Centauri Carbon 2",
+            "software_version": {"mcu_version": "00.00.00.00", "ota_version": "02.01.00.00", "soc_version": ""},
+            "sn": "F013B3B8WZZ9K11",
+            "hostname": "CC_2",
+        }},
+    )
+    await printer._handle_mqtt_message(msg)
+    assert printer.attrs == {
+        "Model":           "Centauri Carbon 2",
+        "FirmwareVersion": "02.01.00.00",
+        "MainboardID":     "F013B3B8WZZ9K11",
+        "Hostname":        "CC_2",
+    }
+
+
+def test_attrs_untouched_without_device_attribute_fields(printer):
+    printer._cc2_state["machine_status"] = {"sub_status": 0}
+    printer._apply_cc2_status()
+    assert printer.attrs == {}
