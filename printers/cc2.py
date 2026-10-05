@@ -76,6 +76,7 @@ class CC2Connection(PrinterConnection):
         self._mqtt_client_id: str | None = None
         self._mqtt_request_id: str | None = None
         self._mqtt_registered  = False
+        self._mqtt_registration_ready = False
         self._cc2_state: dict  = {}
         self._filament_mm_max  = 0.0
         self._prev_state_str   = ""
@@ -111,7 +112,11 @@ class CC2Connection(PrinterConnection):
             self._mqtt_client_id  = f"0cli{ts_hex}{rnd_hex}"[:10]
             self._mqtt_request_id = uuid.uuid4().hex[:16]
             self._mqtt_registered = False
-            # Keep any cached serial from __init__; cleared only on explicit reset
+            self._mqtt_registration_ready = False
+            # Keep the cached serial as a hint only.  Every MQTT session must
+            # observe a fresh status message before registering; otherwise the
+            # printer may acknowledge the client without routing later API
+            # responses (notably method 1046) to it.
 
             async with aiomqtt.Client(
                 hostname=self.ip,
@@ -122,20 +127,16 @@ class CC2Connection(PrinterConnection):
                 self._mqtt_client = client
                 self.camera_url = f"http://{self.ip}:8080/mjpeg"
 
+                # A cached serial must not bypass the printer's session startup
+                # sequence.  Discover/confirm it from a live status message on
+                # every connection, exactly as on a cold container start.
+                await client.subscribe("elegoo/+/api_status")
                 if self._mqtt_serial:
-                    # Fast path: serial known from cache — subscribe only to what we need
-                    sn = self._mqtt_serial
-                    await client.subscribe(f"elegoo/{sn}/api_status")
-                    await client.subscribe(
-                        f"elegoo/{sn}/{self._mqtt_request_id}/register_response"
+                    print(
+                        f"[Printer {self.name}] MQTT open — waiting for status "
+                        f"before full registration (cached SN {self._mqtt_serial})…"
                     )
-                    await client.subscribe(f"elegoo/{sn}/{self._mqtt_client_id}/api_response")
-                    await self._send_registration()
-                    print(f"[Printer {self.name}] MQTT open — registration sent (cached SN {sn})")
                 else:
-                    # Cold start: subscribe to everything so the VERY FIRST message from
-                    # this broker (whatever it is) reveals the serial number immediately.
-                    await client.subscribe("elegoo/#")
                     print(f"[Printer {self.name}] MQTT open — listening for serial (cold start)…")
                 poll_task = asyncio.create_task(self._mqtt_status_poller())
                 try:
@@ -154,6 +155,7 @@ class CC2Connection(PrinterConnection):
         finally:
             self._mqtt_client     = None
             self._mqtt_registered = False
+            self._mqtt_registration_ready = False
             self.connected        = False
             self.camera_url       = f"http://{self.ip}:8080/mjpeg"
             await self._broadcast_state()
@@ -207,12 +209,43 @@ class CC2Connection(PrinterConnection):
             print(f"[Printer {self.name}] MQTT registration send error: {e}")
             return False
 
+    async def _prepare_registration(self, serial: str) -> bool:
+        """Finish subscriptions and register after this session's first status."""
+        if self._mqtt_registration_ready or not self._mqtt_client:
+            return False
+
+        serial_changed = serial != self._mqtt_serial
+        self._mqtt_serial = serial
+        if serial_changed:
+            _save_cached_serial(self.id, serial)
+            print(f"[Printer {self.name}] SN discovered: {serial} (saved to cache)")
+        else:
+            print(f"[Printer {self.name}] SN confirmed: {serial}")
+
+        # Subscribe to every session-specific reply before publishing the
+        # registration.  Keep the exact status subscription before removing
+        # discovery so there is no gap in status delivery.
+        await self._mqtt_client.subscribe(f"elegoo/{serial}/api_status")
+        await self._mqtt_client.subscribe(
+            f"elegoo/{serial}/{self._mqtt_request_id}/register_response"
+        )
+        await self._mqtt_client.subscribe(
+            f"elegoo/{serial}/{self._mqtt_client_id}/api_response"
+        )
+        await self._mqtt_client.unsubscribe("elegoo/+/api_status")
+        self._mqtt_registration_ready = True
+
+        sent = await self._send_registration()
+        if sent:
+            print(f"[Printer {self.name}] CC2 full registration sent")
+        return sent
+
     async def _mqtt_status_poller(self) -> None:
         tick = 0
         while True:
             await asyncio.sleep(5)
             if not self._mqtt_registered:
-                if await self._send_registration():
+                if self._mqtt_registration_ready and await self._send_registration():
                     print(f"[Printer {self.name}] CC2 registration retry sent")
                 continue
             await self.send_cmd(1003)   # machine_status
@@ -222,6 +255,19 @@ class CC2Connection(PrinterConnection):
 
     async def _handle_mqtt_message(self, message) -> None:
         topic = str(message.topic)
+
+        # Registration is deliberately gated on a live status message from the
+        # current MQTT session.  This applies to both cached and newly
+        # discovered serial numbers.
+        parts = topic.split("/")
+        if (
+            not self._mqtt_registration_ready
+            and len(parts) == 3
+            and parts[0] == "elegoo"
+            and parts[1]
+            and parts[2] == "api_status"
+        ):
+            await self._prepare_registration(parts[1])
 
         expected_register_topic = (
             f"elegoo/{self._mqtt_serial}/{self._mqtt_request_id}/register_response"
@@ -363,27 +409,6 @@ class CC2Connection(PrinterConnection):
                 await self._check_print_transition()
                 await self._broadcast_state()
             return
-
-        # Cold-start serial discovery: extract SN from any elegoo/{sn}/... topic
-        if not self._mqtt_serial and not self._mqtt_registered:
-            parts = topic.split("/")
-            if len(parts) >= 3 and parts[0] == "elegoo" and parts[1]:
-                sn = parts[1]
-                self._mqtt_serial = sn
-                _save_cached_serial(self.id, sn)
-                print(f"[Printer {self.name}] SN discovered: {sn} (saved to cache)")
-                if self._mqtt_client:
-                    # Switch from wildcard to specific subscriptions
-                    await self._mqtt_client.unsubscribe("elegoo/#")
-                    await self._mqtt_client.subscribe(f"elegoo/{sn}/api_status")
-                    await self._mqtt_client.subscribe(
-                        f"elegoo/{sn}/{self._mqtt_request_id}/register_response"
-                    )
-                    await self._mqtt_client.subscribe(
-                        f"elegoo/{sn}/{self._mqtt_client_id}/api_response"
-                    )
-                    await self._send_registration()
-                    print(f"[Printer {self.name}] CC2 registration sent")
 
         result = payload.get("result", {})
         if not isinstance(result, dict) or not result:
