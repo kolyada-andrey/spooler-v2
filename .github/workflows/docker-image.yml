@@ -9,8 +9,21 @@ on:
 jobs:
   build:
     runs-on: self-hosted
+    env:
+      # A unique project name prevents one CI run from reusing another run's
+      # containers when the runner executes jobs serially or is retried.
+      COMPOSE_PROJECT_NAME: spooler-ci-${{ github.run_id }}
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build and run compose
-      run: docker compose up --build -d
+
+    - name: Build and wait for healthy services
+      run: docker compose up --build --wait --wait-timeout 150
+
+    - name: Show Compose logs on failure
+      if: failure()
+      run: docker compose logs --no-color
+
+    - name: Tear down Compose services
+      if: always()
+      run: docker compose down --remove-orphans
