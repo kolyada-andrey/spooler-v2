@@ -16,7 +16,7 @@ services:
     environment:
       SPOOLMAN_PORT: "7912"
     volumes:
-      - spoolman_data:/home/app/.local/share/spoolman
+      - /opt/spooler-data/spoolman:/home/app/.local/share/spoolman
     restart: unless-stopped
 
   spooler:
@@ -30,7 +30,7 @@ services:
     environment:
       DATA_DIR: /data
     volumes:
-      - spooler_data:/data
+      - /opt/spooler-data/spooler:/data
     depends_on:
       - spoolman
     restart: unless-stopped
