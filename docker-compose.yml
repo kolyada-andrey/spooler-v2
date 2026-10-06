@@ -35,6 +35,9 @@ services:
       - spoolman
     restart: unless-stopped
 
+  busybox:
+    image: alpine
+
 volumes:
   spoolman_data:
   spooler_data:
