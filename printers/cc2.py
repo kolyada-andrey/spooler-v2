@@ -11,10 +11,16 @@ import uuid
 from pathlib import Path
 
 import state
-from persistence import dump_raw_message
+from persistence import dump_raw_message, save_tray_map
 from printers.base import PrinterConnection
 from printers.error_codes import lookup as lookup_error_code
-from spoolman import spoolman_assign, spoolman_set_location
+from spoolman import (
+    infer_material_from_name,
+    parse_cc2_filename,
+    spoolman_find_or_create_by_material_color,
+    spoolman_set_location,
+    spoolman_assign,
+)
 from printers.protocol import (
     CMD_LIGHT, CMD_PAUSE, CMD_RESUME, CMD_STOP,
     deep_merge,
@@ -73,6 +79,7 @@ class CC2Connection(PrinterConnection):
         self._mqtt_client_id: str | None = None
         self._mqtt_request_id: str | None = None
         self._mqtt_registered  = False
+        self._mqtt_registration_ready = False
         self._cc2_state: dict  = {}
         self._filament_mm_max  = 0.0
         self._prev_state_str   = ""
@@ -82,15 +89,23 @@ class CC2Connection(PrinterConnection):
         self._current_filename    = ""
         self._mqtt_serial         = _load_cached_serial(self.id)
         self._prev_active_tray_id = -2  # sentinel: not yet seen
+        self._canvas_locations_synced = False
         self._pending_thumb_fut: asyncio.Future | None = None
         self._pending_meta_fut:  asyncio.Future | None = None
+        self._pending_thumb_filename = ""
+        self._pending_meta_filename  = ""
+        self._file_info_lock = asyncio.Lock()
         self._expected_filament_g    = 0.0  # from method 1046 at print start
         self._expected_print_time_s  = 0    # from method 1046 at print start
         self._last_active_filament_mm = 0.0 # snapshot for cancelled prints
-        self._meta_fetch_filename    = ""   # avoid duplicate 1046 fetches
+        self._tracked_print_filename = ""
+        self._current_print_metadata: dict | None = None
+        self._print_metadata_task: asyncio.Task | None = None
+        self._print_metadata_event: asyncio.Event | None = None
 
     async def connect(self) -> None:
         self._prev_active_tray_id = -2
+        self._canvas_locations_synced = False
         if not AIOMQTT_AVAILABLE:
             print(f"[Printer {self.name}] aiomqtt not installed — CC2 unavailable")
             await self._broadcast_state()
@@ -102,7 +117,11 @@ class CC2Connection(PrinterConnection):
             self._mqtt_client_id  = f"0cli{ts_hex}{rnd_hex}"[:10]
             self._mqtt_request_id = uuid.uuid4().hex[:16]
             self._mqtt_registered = False
-            # Keep any cached serial from __init__; cleared only on explicit reset
+            self._mqtt_registration_ready = False
+            # Keep the cached serial as a hint only.  Every MQTT session must
+            # observe a fresh status message before registering; otherwise the
+            # printer may acknowledge the client without routing later API
+            # responses (notably method 1046) to it.
 
             async with aiomqtt.Client(
                 hostname=self.ip,
@@ -111,26 +130,18 @@ class CC2Connection(PrinterConnection):
                 password=self.access_code,
             ) as client:
                 self._mqtt_client = client
-                await client.subscribe("elegoo/+/+/register_response")
                 self.camera_url = f"http://{self.ip}:8080/mjpeg"
 
+                # A cached serial must not bypass the printer's session startup
+                # sequence.  Discover/confirm it from a live status message on
+                # every connection, exactly as on a cold container start.
+                await client.subscribe("elegoo/+/api_status")
                 if self._mqtt_serial:
-                    # Fast path: serial known from cache — subscribe only to what we need
-                    sn = self._mqtt_serial
-                    await client.subscribe(f"elegoo/{sn}/api_status")
-                    await client.subscribe(f"elegoo/{sn}/{self._mqtt_client_id}/api_response")
-                    await client.publish(
-                        f"elegoo/{sn}/api_register",
-                        json.dumps({
-                            "client_id":  self._mqtt_client_id,
-                            "request_id": self._mqtt_request_id,
-                        }),
+                    print(
+                        f"[Printer {self.name}] MQTT open — waiting for status "
+                        f"before full registration (cached SN {self._mqtt_serial})…"
                     )
-                    print(f"[Printer {self.name}] MQTT open — registration sent (cached SN {sn})")
                 else:
-                    # Cold start: subscribe to everything so the VERY FIRST message from
-                    # this broker (whatever it is) reveals the serial number immediately.
-                    await client.subscribe("elegoo/#")
                     print(f"[Printer {self.name}] MQTT open — listening for serial (cold start)…")
                 poll_task = asyncio.create_task(self._mqtt_status_poller())
                 try:
@@ -149,6 +160,7 @@ class CC2Connection(PrinterConnection):
         finally:
             self._mqtt_client     = None
             self._mqtt_registered = False
+            self._mqtt_registration_ready = False
             self.connected        = False
             self.camera_url       = f"http://{self.ip}:8080/mjpeg"
             await self._broadcast_state()
@@ -180,24 +192,99 @@ class CC2Connection(PrinterConnection):
             print(f"[Printer {self.name}] MQTT send error: {e}")
             return False
 
+    async def _send_registration(self) -> bool:
+        """Publish the CC2 registration handshake for the current MQTT session."""
+        if (
+            not self._mqtt_client
+            or not self._mqtt_serial
+            or not self._mqtt_client_id
+            or not self._mqtt_request_id
+        ):
+            return False
+        try:
+            await self._mqtt_client.publish(
+                f"elegoo/{self._mqtt_serial}/api_register",
+                json.dumps({
+                    "client_id": self._mqtt_client_id,
+                    "request_id": self._mqtt_request_id,
+                }),
+            )
+            return True
+        except Exception as e:
+            print(f"[Printer {self.name}] MQTT registration send error: {e}")
+            return False
+
+    async def _prepare_registration(self, serial: str) -> bool:
+        """Finish subscriptions and register after this session's first status."""
+        if self._mqtt_registration_ready or not self._mqtt_client:
+            return False
+
+        serial_changed = serial != self._mqtt_serial
+        self._mqtt_serial = serial
+        if serial_changed:
+            _save_cached_serial(self.id, serial)
+            print(f"[Printer {self.name}] SN discovered: {serial} (saved to cache)")
+        else:
+            print(f"[Printer {self.name}] SN confirmed: {serial}")
+
+        # Subscribe to every session-specific reply before publishing the
+        # registration.  Keep the exact status subscription before removing
+        # discovery so there is no gap in status delivery.
+        await self._mqtt_client.subscribe(f"elegoo/{serial}/api_status")
+        await self._mqtt_client.subscribe(
+            f"elegoo/{serial}/{self._mqtt_request_id}/register_response"
+        )
+        await self._mqtt_client.subscribe(
+            f"elegoo/{serial}/{self._mqtt_client_id}/api_response"
+        )
+        await self._mqtt_client.unsubscribe("elegoo/+/api_status")
+        self._mqtt_registration_ready = True
+
+        sent = await self._send_registration()
+        if sent:
+            print(f"[Printer {self.name}] CC2 full registration sent")
+        return sent
+
     async def _mqtt_status_poller(self) -> None:
         tick = 0
         while True:
             await asyncio.sleep(5)
-            if self._mqtt_registered:
-                await self.send_cmd(1003)   # machine_status
-                if tick % 2 == 0:
-                    await self.send_cmd(2005)  # canvas channel info
-                tick += 1
+            if not self._mqtt_registered:
+                if self._mqtt_registration_ready and await self._send_registration():
+                    print(f"[Printer {self.name}] CC2 registration retry sent")
+                continue
+            await self.send_cmd(1003)   # machine_status
+            if tick % 2 == 0:
+                await self.send_cmd(2005)  # canvas channel info
+            tick += 1
 
     async def _handle_mqtt_message(self, message) -> None:
         topic = str(message.topic)
         dump_raw_message(self.id, f"cc2_mqtt:{topic}", message.payload)
 
-        if "register_response" in topic:
+        # Registration is deliberately gated on a live status message from the
+        # current MQTT session.  This applies to both cached and newly
+        # discovered serial numbers.
+        parts = topic.split("/")
+        if (
+            not self._mqtt_registration_ready
+            and len(parts) == 3
+            and parts[0] == "elegoo"
+            and parts[1]
+            and parts[2] == "api_status"
+        ):
+            await self._prepare_registration(parts[1])
+
+        expected_register_topic = (
+            f"elegoo/{self._mqtt_serial}/{self._mqtt_request_id}/register_response"
+            if self._mqtt_serial and self._mqtt_request_id else ""
+        )
+        if topic == expected_register_topic:
             try:
                 p = json.loads(message.payload.decode())
                 if p.get("error") == "ok":
+                    if self._mqtt_registered:
+                        return
                     self._mqtt_registered = True
                     self.connected = True
                     print(f"[Printer {self.name}] CC2 registered OK — ready")
@@ -208,6 +295,13 @@ class CC2Connection(PrinterConnection):
                     await self.send_cmd(1042)  # camera URL
                     await self.send_cmd(2005)  # canvas channel info
                     await self.send_cmd(1056)  # extruder filament info
+                    if self._current_filename and self._print_is_active():
+                        # Status pushes may arrive before the printer is ready
+                        # to acknowledge registration. Restart the metadata
+                        # lookup now that authenticated commands can succeed.
+                        self._begin_print_tracking(
+                            self._current_filename, force=True
+                        )
                     loop = asyncio.get_running_loop()
                     loop.run_in_executor(None, self._sync_spoolman_locations)
                 else:
@@ -263,25 +357,37 @@ class CC2Connection(PrinterConnection):
             # Thumbnail response (method 1045)
             if _method == 1045 and isinstance(inner, dict):
                 if self._pending_thumb_fut and not self._pending_thumb_fut.done():
-                    b64 = inner.get("thumbnail") or inner.get("data") or inner.get("image")
-                    self._pending_thumb_fut.set_result(b64 if isinstance(b64, str) else None)
+                    response_filename = str(inner.get("filename") or "")
+                    if (not response_filename or self._same_filename(
+                            response_filename, self._pending_thumb_filename)):
+                        b64 = inner.get("thumbnail") or inner.get("data") or inner.get("image")
+                        self._pending_thumb_fut.set_result(b64 if isinstance(b64, str) else None)
                 return
 
             # File metadata response (method 1046)
             if _method == 1046 and isinstance(inner, dict):
-                if self._pending_meta_fut and not self._pending_meta_fut.done():
+                response_filename = str(inner.get("filename") or "")
+                if (self._pending_meta_fut and not self._pending_meta_fut.done()
+                        and self._same_filename(
+                            response_filename, self._pending_meta_filename)):
                     self._pending_meta_fut.set_result(inner)
-                # Always store expected filament + duration for live tracking
-                fila_g = inner.get("total_filament_used")
-                if fila_g is not None and float(fila_g or 0) > 0:
-                    self._expected_filament_g = float(fila_g)
-                pt = inner.get("print_time")
-                if pt is not None and int(pt or 0) > 0:
-                    self._expected_print_time_s = int(pt)
-                if self._expected_filament_g or self._expected_print_time_s:
-                    print(f"[Printer {self.name}] File metadata: "
-                          f"{self._expected_filament_g}g / {self._expected_print_time_s}s")
-                    print(f"[Printer {self.name}] 1046 full response: {json.dumps(inner)[:600]}")
+                print(f"[Printer {self.name}] 1046 full response: {json.dumps(inner)[:600]}")
+                if self._same_filename(response_filename, self._current_filename):
+                    # Only metadata for the current job can influence its
+                    # progress, spool selection, and deduction.
+                    self._current_print_metadata = inner
+                    fila_g = inner.get("total_filament_used")
+                    if fila_g is not None and float(fila_g or 0) > 0:
+                        self._expected_filament_g = float(fila_g)
+                    pt = inner.get("print_time")
+                    if pt is not None and int(pt or 0) > 0:
+                        self._expected_print_time_s = int(pt)
+                    if self._expected_filament_g or self._expected_print_time_s:
+                        print(f"[Printer {self.name}] File metadata: "
+                              f"{self._expected_filament_g}g / {self._expected_print_time_s}s")
+                    if self._print_metadata_event:
+                        self._print_metadata_event.set()
+                    asyncio.create_task(self._auto_link_spools_from_metadata(inner))
                 return
 
             source = inner if isinstance(inner, dict) else payload
@@ -325,30 +431,6 @@ class CC2Connection(PrinterConnection):
                 await self._broadcast_state()
             return
 
-        # Cold-start serial discovery: extract SN from any elegoo/{sn}/... topic
-        if not self._mqtt_serial and not self._mqtt_registered:
-            parts = topic.split("/")
-            if len(parts) >= 3 and parts[0] == "elegoo" and parts[1]:
-                sn = parts[1]
-                self._mqtt_serial = sn
-                _save_cached_serial(self.id, sn)
-                print(f"[Printer {self.name}] SN discovered: {sn} (saved to cache)")
-                if self._mqtt_client:
-                    # Switch from wildcard to specific subscriptions
-                    await self._mqtt_client.unsubscribe("elegoo/#")
-                    await self._mqtt_client.subscribe(f"elegoo/{sn}/api_status")
-                    await self._mqtt_client.subscribe(
-                        f"elegoo/{sn}/{self._mqtt_client_id}/api_response"
-                    )
-                    await self._mqtt_client.publish(
-                        f"elegoo/{sn}/api_register",
-                        json.dumps({
-                            "client_id":  self._mqtt_client_id,
-                            "request_id": self._mqtt_request_id,
-                        }),
-                    )
-                    print(f"[Printer {self.name}] CC2 registration sent")
-
         result = payload.get("result", {})
         if not isinstance(result, dict) or not result:
             return
@@ -383,22 +465,29 @@ class CC2Connection(PrinterConnection):
         """Fetch thumbnail (1045) + metadata (1046) via MQTT and broadcast file_info."""
         if not self._mqtt_registered:
             return
-        loop = asyncio.get_running_loop()
-        self._pending_thumb_fut = loop.create_future()
-        self._pending_meta_fut  = loop.create_future()
-        await self.send_cmd(1045, {"storage_media": "local", "filename": filename})
-        await self.send_cmd(1046, {"storage_media": "local", "filename": filename})
-        try:
-            results = await asyncio.wait_for(
-                asyncio.gather(self._pending_thumb_fut, self._pending_meta_fut,
-                               return_exceptions=True),
-                timeout=10,
-            )
-        except asyncio.TimeoutError:
-            results = [None, {}]
-        finally:
-            self._pending_thumb_fut = None
-            self._pending_meta_fut  = None
+        # MQTT responses do not expose a request id reliably, so do not allow
+        # two browser lookups to overwrite each other's single response futures.
+        async with self._file_info_lock:
+            loop = asyncio.get_running_loop()
+            self._pending_thumb_fut = loop.create_future()
+            self._pending_meta_fut  = loop.create_future()
+            self._pending_thumb_filename = filename
+            self._pending_meta_filename = filename
+            await self.send_cmd(1045, {"storage_media": "local", "filename": filename})
+            await self.send_cmd(1046, {"storage_media": "local", "filename": filename})
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(self._pending_thumb_fut, self._pending_meta_fut,
+                                   return_exceptions=True),
+                    timeout=10,
+                )
+            except asyncio.TimeoutError:
+                results = [None, {}]
+            finally:
+                self._pending_thumb_fut = None
+                self._pending_meta_fut  = None
+                self._pending_thumb_filename = ""
+                self._pending_meta_filename = ""
 
         thumb_b64 = results[0] if isinstance(results[0], str) else None
         meta      = results[1] if isinstance(results[1], dict) else {}
@@ -413,10 +502,54 @@ class CC2Connection(PrinterConnection):
         })
 
     def _sync_spoolman_locations(self) -> None:
-        """On connect, push all tray-linked spool locations to Spoolman."""
+        """On connect, push Canvas tray-linked spools to Spoolman.
+
+        A regular CC2 has no Canvas and uses one spool assigned directly to
+        the printer's Spoolman location.  Never reinterpret a persisted tray
+        map as a Canvas for such a printer.
+        """
+        if not self._has_canvas():
+            return
         for spool_id in (state.tray_map.get(self.id) or {}).values():
             if spool_id is not None:
                 spoolman_set_location(spool_id, self.id)
+
+    def _has_canvas(self) -> bool:
+        """Return whether the printer has reported an active physical Canvas tray.
+
+        The firmware exposes four placeholder slots even when no Canvas is
+        installed.  Those slots are indistinguishable by shape alone, but the
+        printer leaves ``active_tray_id`` at -1.  Require a non-negative
+        active tray that exists in the reported list before treating it as
+        Canvas telemetry.
+        """
+        canvas_info = self._cc2_state.get("canvas_info")
+        if not isinstance(canvas_info, dict):
+            return False
+        try:
+            active_tray_id = int(canvas_info.get("active_tray_id", -1))
+        except (TypeError, ValueError):
+            return False
+        if active_tray_id < 0:
+            return False
+        canvas_list = canvas_info.get("canvas_list")
+        if not isinstance(canvas_list, list):
+            return False
+        for canvas in canvas_list:
+            if not isinstance(canvas, dict):
+                continue
+            trays = canvas.get("tray_list")
+            if not isinstance(trays, list):
+                continue
+            for tray in trays:
+                if not isinstance(tray, dict):
+                    continue
+                try:
+                    if int(tray.get("tray_id", -1)) == active_tray_id:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        return False
 
     def _protocol_reason_hint(self) -> dict | None:
         # Most error_code values aren't verified against real hardware yet —
@@ -444,10 +577,251 @@ class CC2Connection(PrinterConnection):
                 "error": "File list request timed out.",
             })
 
+    @staticmethod
+    def _same_filename(left: str, right: str) -> bool:
+        """Compare printer paths without treating an empty response as a match."""
+        return bool(left and right and Path(left).name == Path(right).name)
+
+    def _print_is_active(self) -> bool:
+        """Return whether either raw or normalized CC2 state shows an active job."""
+        print_state = self._cc2_state.get("print_status", {}).get("state", "")
+        normalized_status = self._decoded_printinfo().get("Status")
+        return (
+            print_state in ("printing", "paused")
+            or normalized_status in (2, 3, 4, 5, 6, 7, 13)
+        )
+
+    def _begin_print_tracking(self, filename: str, *, force: bool = False) -> None:
+        """Reset one CC2 job and fetch its 1046 metadata with bounded retries."""
+        if not filename:
+            return
+        same_job = self._same_filename(filename, self._tracked_print_filename)
+        fetch_in_progress = (
+            self._print_metadata_task is not None
+            and not self._print_metadata_task.done()
+        )
+        if not force and same_job and (fetch_in_progress or self._current_print_metadata):
+            return
+        if self._print_metadata_task and not self._print_metadata_task.done():
+            self._print_metadata_task.cancel()
+        self._tracked_print_filename = filename
+        self._current_print_metadata = None
+        self._filament_mm_max = 0.0
+        self._extruder_offset = 0.0
+        self._last_extruder = 0.0
+        self._expected_filament_g = 0.0
+        self._expected_print_time_s = 0
+        self._last_active_filament_mm = 0.0
+        self._print_metadata_task = asyncio.create_task(
+            self._fetch_print_metadata(filename)
+        )
+
+    async def _fetch_print_metadata(self, filename: str) -> None:
+        """Request 1046 until it arrives, the job changes, or retries are exhausted."""
+        event: asyncio.Event | None = None
+        try:
+            for attempt in range(1, 4):
+                if not self._same_filename(filename, self._current_filename):
+                    return
+                event = asyncio.Event()
+                self._print_metadata_event = event
+                sent = await self.send_cmd(
+                    1046, {"storage_media": "local", "filename": filename}
+                )
+                if sent:
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=4)
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                if attempt < 3:
+                    await asyncio.sleep(2)
+            if self._mqtt_registered:
+                print(f"[Printer {self.name}] 1046 unavailable for {filename!r} after 3 attempts")
+        finally:
+            if self._print_metadata_event is event:
+                self._print_metadata_event = None
+
+    def _start_auto_link_for_current_metadata(self) -> None:
+        if self._current_print_metadata:
+            asyncio.create_task(
+                self._auto_link_spools_from_metadata(self._current_print_metadata)
+            )
+
+    async def _auto_link_spools_from_metadata(self, meta: dict) -> None:
+        """Auto-assign a single spool or link reported Canvas trays.
+
+        Single-material printers are assigned exactly one matching spool at
+        the printer's Spoolman location.  Only a confirmed physical Canvas
+        may create tray_map entries.
+        """
+        color_map = meta.get("color_map")
+        meta_filename = str(meta.get("filename") or "")
+        current_filename = str(self._current_filename or "")
+        filename_meta = parse_cc2_filename(meta_filename or current_filename)
+        if not isinstance(color_map, list):
+            color_map = []
+        if not color_map and filename_meta:
+            material = (
+                filename_meta.get("material")
+                or infer_material_from_name(filename_meta.get("filament_name", ""))
+            )
+            color = filename_meta.get("color_hex")
+            if material and color:
+                color_map = [{"name": material, "color": color}]
+        if not color_map:
+            return
+
+        # Newer firmware may omit print_status.state and expose the active
+        # phase only through machine_status.sub_status.  _apply_cc2_status()
+        # has already normalized that value into PrintInfo.Status.
+        if not self._print_is_active():
+            return
+
+        if (
+            meta_filename
+            and current_filename
+            and Path(meta_filename).name != Path(current_filename).name
+        ):
+            print(
+                f"[Printer {self.name}] Auto-match ignored: metadata file "
+                f"{meta_filename!r} != current file {current_filename!r}"
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+
+        if not self._has_canvas():
+            # There is no physical slot to map.  Only a single material can
+            # be safely auto-assigned to this printer; a multi-colour file
+            # requires real Canvas slot telemetry.
+            if len(color_map) != 1 or not isinstance(color_map[0], dict):
+                return
+            item = color_map[0]
+            material = str(
+                filename_meta.get("material") or item.get("name") or ""
+            ).strip()
+            color = str(
+                filename_meta.get("color_hex") or item.get("color") or ""
+            ).strip()
+            filament_name = str(
+                filename_meta.get("display_name")
+                or filename_meta.get("filament_name")
+                or ""
+            ).strip()
+            vendor_name = str(filename_meta.get("vendor_name") or "").strip()
+            if not material or not color:
+                return
+            spool = await loop.run_in_executor(
+                None,
+                spoolman_find_or_create_by_material_color,
+                material,
+                color,
+                self.id,
+                filament_name,
+                vendor_name,
+            )
+            if not spool:
+                return
+            spool_id = int(spool["id"])
+            await loop.run_in_executor(None, spoolman_assign, self.id, spool_id)
+            density = (spool.get("filament") or {}).get("density")
+            if density:
+                try:
+                    self.filament_density = float(density)
+                except (TypeError, ValueError):
+                    pass
+            self._current_print_spool = spool_id
+            print(
+                f"[Printer {self.name}] Auto-assigned spool {spool_id} "
+                f"({material} {color})"
+            )
+            return
+
+        matched_spools = []
+        mapping_changed = False
+
+        for item in color_map:
+            if not isinstance(item, dict):
+                continue
+
+            material = str(
+                filename_meta.get("material") or item.get("name") or ""
+            ).strip()
+            # The slicer's color_map can contain its generic preview color
+            # (#000000 in particular). The configured output filename carries
+            # default_filament_colour and is authoritative when present.
+            color = str(
+                filename_meta.get("color_hex") or item.get("color") or ""
+            ).strip()
+            filament_name = str(
+                filename_meta.get("display_name")
+                or filename_meta.get("filament_name")
+                or ""
+            ).strip()
+            vendor_name = str(filename_meta.get("vendor_name") or "").strip()
+            try:
+                tray_id = int(item.get("t", 0))
+            except (TypeError, ValueError):
+                tray_id = 0
+
+            if not material or not color:
+                continue
+
+            spool = await loop.run_in_executor(
+                None,
+                spoolman_find_or_create_by_material_color,
+                material,
+                color,
+                self.id,
+                filament_name,
+                vendor_name,
+            )
+            if not spool:
+                continue
+
+            spool_id = int(spool["id"])
+            printer_trays = state.tray_map.setdefault(self.id, {})
+            tray_key = str(tray_id)
+            if printer_trays.get(tray_key) != spool_id:
+                printer_trays[tray_key] = spool_id
+                mapping_changed = True
+
+            matched_spools.append(spool_id)
+            await loop.run_in_executor(
+                None, spoolman_set_location, spool_id, self.id
+            )
+
+            density = (spool.get("filament") or {}).get("density")
+            if density:
+                try:
+                    self.filament_density = float(density)
+                except (TypeError, ValueError):
+                    pass
+
+            print(
+                f"[Printer {self.name}] Auto-linked Slot {tray_id + 1} → "
+                f"Spool {spool_id} ({material} {color})"
+            )
+
+        if mapping_changed:
+            await loop.run_in_executor(None, save_tray_map, state.tray_map)
+            await state.broadcast_to_browsers({
+                "type": "tray_map",
+                "tray_map": state.tray_map,
+            })
+
+        if len(matched_spools) == 1:
+            self._current_print_spool = matched_spools[0]
+            print(
+                f"[Printer {self.name}] Current print spool → "
+                f"{matched_spools[0]}"
+            )
+
     async def start_print_file(self, filename: str, print_opts: dict | None = None) -> bool:
         self._current_filename = filename
         opts = print_opts or {}
-        return await self.send_cmd(1020, {
+        ok = await self.send_cmd(1020, {
             "filename":      filename,
             "storage_media": "local",
             "config": {
@@ -456,6 +830,11 @@ class CC2Connection(PrinterConnection):
                 "print_layout":  "B" if opts.get("smooth_plate") else "A",
             },
         })
+        if ok:
+            # Do not rely on a subsequent state push: some firmware revisions
+            # report only a sub_status while starting a job.
+            self._begin_print_tracking(filename, force=True)
+        return ok
 
     def _apply_cc2_status(self) -> None:
         s     = self._cc2_state
@@ -546,41 +925,53 @@ class CC2Connection(PrinterConnection):
             remaining      = 0
 
         # CC2 doesn't report remaining_time_sec — estimate from file's expected duration
-        if remaining == 0 and state_str == "printing" and self._expected_print_time_s > 0:
+        if remaining == 0 and status_code == 3 and self._expected_print_time_s > 0:
             remaining = max(0, self._expected_print_time_s - print_duration)
 
         total    = print_duration + remaining
         progress = min(100, round(print_duration / total * 100)) if total > 0 else 0
 
-        new_print = state_str == "printing" and self._prev_state_str not in ("printing", "paused")
-        if new_print:
-            self._filament_mm_max        = 0.0
-            self._extruder_offset        = 0.0
-            self._last_extruder          = 0.0
-            self._expected_filament_g    = 0.0
-            self._expected_print_time_s  = 0
-            self._last_active_filament_mm = 0.0
-            fname = self._current_filename
-            if fname and fname != self._meta_fetch_filename:
-                self._meta_fetch_filename = fname
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(
-                        self.send_cmd(1046, {"storage_media": "local", "filename": fname})
-                    )
-                except RuntimeError:
-                    pass
+        # Some firmware versions omit print_status.state and expose the active
+        # phase only through sub_status.  Keep a normalized state edge for
+        # metadata fetching and per-print cleanup in that case.
+        tracking_state = state_str
+        if not tracking_state:
+            if status_code == 3:
+                tracking_state = "printing"
+            elif status_code == 9:
+                tracking_state = "complete"
+            elif status_code == 8:
+                tracking_state = "cancelled"
+            elif status_code == 14:
+                tracking_state = "error"
+            elif status_code == 0 and self._prev_state_str in ("printing", "paused"):
+                tracking_state = "standby"
 
-        if state_str:
-            self._prev_state_str = state_str
+        prev_state_str = self._prev_state_str
+        print_ending = (
+            tracking_state in ("complete", "standby", "cancelled", "error")
+            and prev_state_str in ("printing", "paused")
+        )
+        new_print = (
+            tracking_state == "printing"
+            and prev_state_str not in ("printing", "paused")
+        )
+        if new_print:
+            fname = self._current_filename
+            if fname:
+                self._begin_print_tracking(fname)
+                self._start_auto_link_for_current_metadata()
 
         # CC2 MQTT never sends filament_used or reliable gcode_move.extruder.
         # Use time-progress × expected grams (from method 1046) instead.
         if self._expected_filament_g > 0:
             density = self.filament_density or 1.24
             expected_mm = self._expected_filament_g * 10.0 / (math.pi * 0.0875 ** 2 * density)
-            just_finished = state_str in ("complete", "standby") and self._prev_state_str in ("printing", "paused")
-            if state_str == "printing" and (print_duration + remaining) > 0:
+            just_finished = (
+                tracking_state in ("complete", "standby")
+                and prev_state_str in ("printing", "paused")
+            )
+            if tracking_state == "printing" and (print_duration + remaining) > 0:
                 filament_mm = print_duration / (print_duration + remaining) * expected_mm
                 self._last_active_filament_mm = filament_mm
             elif just_finished:
@@ -597,6 +988,14 @@ class CC2Connection(PrinterConnection):
                 self._extruder_offset += self._last_extruder
             self._last_extruder = raw_ext
             filament_mm = max(self._filament_mm_max, self._extruder_offset + raw_ext)
+
+        if print_ending:
+            self._tracked_print_filename = ""
+            if self._print_metadata_task and not self._print_metadata_task.done():
+                self._print_metadata_task.cancel()
+
+        if tracking_state:
+            self._prev_state_str = tracking_state
 
         led    = s.get("led", {})
         led_on = 1 if (led.get("status", 0) or 0) > 0 else 0
@@ -625,9 +1024,16 @@ class CC2Connection(PrinterConnection):
             "SpeedFactor":      round(speed_factor * 100),
         }
 
-        # Expose canvas tray info so the browser can render filament slots
+        # Expose and synchronize tray mappings only after the protocol has
+        # confirmed physical Canvas trays.  Empty canvas_info is normal on a
+        # single-material printer and must keep its regular spool UI intact.
         ci = s.get("canvas_info", {})
-        if ci:
+        if self._has_canvas():
+            if not self._canvas_locations_synced:
+                self._canvas_locations_synced = True
+                asyncio.get_running_loop().run_in_executor(
+                    None, self._sync_spoolman_locations,
+                )
             self.status["canvas_info"] = ci
             active_tray = ci.get("active_tray_id", -1)
             if active_tray != self._prev_active_tray_id:
