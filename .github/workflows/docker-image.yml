@@ -6,24 +6,42 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# The Compose stack uses host networking, so two deployments on this runner
+# cannot safely coexist. Queue rather than interrupt an in-progress deploy.
+concurrency:
+  group: compose-deploy-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: self-hosted
     env:
-      # A unique project name prevents one CI run from reusing another run's
-      # containers when the runner executes jobs serially or is retried.
-      COMPOSE_PROJECT_NAME: spooler-ci-${{ github.run_id }}
+      # A stable name lets each run replace the stack deployed by the last one.
+      COMPOSE_PROJECT_NAME: spooler-ci
 
     steps:
     - uses: actions/checkout@v4
 
+    - name: Remove stale CI Compose containers
+      shell: bash
+      run: |
+        # Older workflow revisions used a run-specific project name.  Remove
+        # only containers created by those CI projects, never user stacks.
+        docker ps -aq --filter label=com.docker.compose.project | while read -r container; do
+          project=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$container")
+          case "$project" in
+            spooler-ci|spooler-ci-*) docker rm -f "$container" ;;
+          esac
+        done
+        docker compose down --remove-orphans
+
     - name: Build and wait for healthy services
-      run: docker compose up --build --wait --wait-timeout 150
+      run: docker compose up --build --force-recreate --wait --wait-timeout 150
 
     - name: Show Compose logs on failure
       if: failure()
       run: docker compose logs --no-color
 
-    - name: Tear down Compose services
+    - name: Remove failed Compose deployment
       if: failure()
       run: docker compose down --remove-orphans
