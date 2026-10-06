@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import state
 from printers.cc2 import CC2Connection
 
 
@@ -122,6 +123,52 @@ def test_camera_connected_false_when_reported(printer):
 def test_camera_connected_stays_unknown_without_external_device(printer):
     printer._apply_cc2_status()
     assert printer.camera_connected is None
+
+
+# ── Canvas detection and spool mapping ──────────────────────────────────────
+
+def test_has_canvas_requires_a_reported_tray(printer):
+    assert not printer._has_canvas()
+
+    printer._cc2_state["canvas_info"] = {"canvas_list": []}
+    assert not printer._has_canvas()
+
+    printer._cc2_state["canvas_info"] = {
+        "canvas_list": [{"tray_list": [{"tray_id": 0}]}],
+    }
+    assert printer._has_canvas()
+
+
+@pytest.mark.asyncio
+async def test_metadata_assigns_single_spool_without_creating_a_canvas_slot(
+    printer, monkeypatch,
+):
+    """Single-material metadata assigns the printer, never a fake Slot 1."""
+    printer._current_filename = "single-material.gcode"
+    printer._cc2_state["print_status"] = {"state": "printing"}
+    monkeypatch.setattr(state, "tray_map", {})
+    assigned = []
+
+    def find_spool(*args, **kwargs):
+        return {"id": 42, "filament": {"density": 1.24}}
+
+    monkeypatch.setattr(
+        "printers.cc2.spoolman_find_or_create_by_material_color",
+        find_spool,
+    )
+    monkeypatch.setattr(
+        "printers.cc2.spoolman_assign",
+        lambda printer_id, spool_id: assigned.append((printer_id, spool_id)),
+    )
+
+    await printer._auto_link_spools_from_metadata({
+        "filename": "single-material.gcode",
+        "color_map": [{"t": 0, "name": "PLA", "color": "FFFFFF"}],
+    })
+
+    assert state.tray_map == {}
+    assert assigned == [("pid1", 42)]
+    assert printer._current_print_spool == 42
 
 
 # ── Device attributes (method 1001) ──────────────────────────────────────────

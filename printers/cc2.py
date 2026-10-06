@@ -89,6 +89,7 @@ class CC2Connection(PrinterConnection):
         self._current_filename    = ""
         self._mqtt_serial         = _load_cached_serial(self.id)
         self._prev_active_tray_id = -2  # sentinel: not yet seen
+        self._canvas_locations_synced = False
         self._pending_thumb_fut: asyncio.Future | None = None
         self._pending_meta_fut:  asyncio.Future | None = None
         self._pending_thumb_filename = ""
@@ -104,6 +105,7 @@ class CC2Connection(PrinterConnection):
 
     async def connect(self) -> None:
         self._prev_active_tray_id = -2
+        self._canvas_locations_synced = False
         if not AIOMQTT_AVAILABLE:
             print(f"[Printer {self.name}] aiomqtt not installed — CC2 unavailable")
             await self._broadcast_state()
@@ -500,10 +502,38 @@ class CC2Connection(PrinterConnection):
         })
 
     def _sync_spoolman_locations(self) -> None:
-        """On connect, push all tray-linked spool locations to Spoolman."""
+        """On connect, push Canvas tray-linked spools to Spoolman.
+
+        A regular CC2 has no Canvas and uses one spool assigned directly to
+        the printer's Spoolman location.  Never reinterpret a persisted tray
+        map as a Canvas for such a printer.
+        """
+        if not self._has_canvas():
+            return
         for spool_id in (state.tray_map.get(self.id) or {}).values():
             if spool_id is not None:
                 spoolman_set_location(spool_id, self.id)
+
+    def _has_canvas(self) -> bool:
+        """Return whether the printer has reported at least one Canvas tray.
+
+        ``canvas_info`` itself is not evidence of a physical Canvas: firmware
+        can return an empty structure for single-material printers.  A tray
+        list is the protocol signal that makes tray-to-spool mapping safe.
+        """
+        canvas_info = self._cc2_state.get("canvas_info")
+        if not isinstance(canvas_info, dict):
+            return False
+        canvas_list = canvas_info.get("canvas_list")
+        return (
+            isinstance(canvas_list, list)
+            and any(
+                isinstance(canvas, dict)
+                and isinstance(canvas.get("tray_list"), list)
+                and canvas["tray_list"]
+                for canvas in canvas_list
+            )
+        )
 
     def _protocol_reason_hint(self) -> dict | None:
         # Most error_code values aren't verified against real hardware yet —
@@ -603,7 +633,12 @@ class CC2Connection(PrinterConnection):
             )
 
     async def _auto_link_spools_from_metadata(self, meta: dict) -> None:
-        """Link CC2 trays to exact material/color matches in Spoolman."""
+        """Auto-assign a single spool or link reported Canvas trays.
+
+        Single-material printers are assigned exactly one matching spool at
+        the printer's Spoolman location.  Only a confirmed physical Canvas
+        may create tray_map entries.
+        """
         color_map = meta.get("color_map")
         meta_filename = str(meta.get("filename") or "")
         current_filename = str(self._current_filename or "")
@@ -611,17 +646,13 @@ class CC2Connection(PrinterConnection):
         if not isinstance(color_map, list):
             color_map = []
         if not color_map and filename_meta:
-            filament_name = filename_meta.get("filament_name", "")
             material = (
                 filename_meta.get("material")
-                or infer_material_from_name(filament_name)
+                or infer_material_from_name(filename_meta.get("filament_name", ""))
             )
-            if material:
-                color_map = [{
-                    "name": material,
-                    "color": filename_meta.get("color_hex"),
-                    "t": 0,
-                }]
+            color = filename_meta.get("color_hex")
+            if material and color:
+                color_map = [{"name": material, "color": color}]
         if not color_map:
             return
 
@@ -643,6 +674,54 @@ class CC2Connection(PrinterConnection):
             return
 
         loop = asyncio.get_running_loop()
+
+        if not self._has_canvas():
+            # There is no physical slot to map.  Only a single material can
+            # be safely auto-assigned to this printer; a multi-colour file
+            # requires real Canvas slot telemetry.
+            if len(color_map) != 1 or not isinstance(color_map[0], dict):
+                return
+            item = color_map[0]
+            material = str(
+                filename_meta.get("material") or item.get("name") or ""
+            ).strip()
+            color = str(
+                filename_meta.get("color_hex") or item.get("color") or ""
+            ).strip()
+            filament_name = str(
+                filename_meta.get("display_name")
+                or filename_meta.get("filament_name")
+                or ""
+            ).strip()
+            vendor_name = str(filename_meta.get("vendor_name") or "").strip()
+            if not material or not color:
+                return
+            spool = await loop.run_in_executor(
+                None,
+                spoolman_find_or_create_by_material_color,
+                material,
+                color,
+                self.id,
+                filament_name,
+                vendor_name,
+            )
+            if not spool:
+                return
+            spool_id = int(spool["id"])
+            await loop.run_in_executor(None, spoolman_assign, self.id, spool_id)
+            density = (spool.get("filament") or {}).get("density")
+            if density:
+                try:
+                    self.filament_density = float(density)
+                except (TypeError, ValueError):
+                    pass
+            self._current_print_spool = spool_id
+            print(
+                f"[Printer {self.name}] Auto-assigned spool {spool_id} "
+                f"({material} {color})"
+            )
+            return
+
         matched_spools = []
         mapping_changed = False
 
@@ -894,19 +973,6 @@ class CC2Connection(PrinterConnection):
             self._last_extruder = raw_ext
             filament_mm = max(self._filament_mm_max, self._extruder_offset + raw_ext)
 
-        # CC2 reports active_tray_id=-1 for ordinary single-material prints.
-        # If the base tracker lost the asynchronously auto-selected spool, recover
-        # the exact spool most recently linked to Slot 1 instead of falling back
-        # to the first Spoolman item sharing the printer location.
-        if print_ending and self._current_print_spool is None:
-            slot_one_spool = (state.tray_map.get(self.id) or {}).get("0")
-            if slot_one_spool is not None:
-                self._current_print_spool = int(slot_one_spool)
-                print(
-                    f"[Printer {self.name}] Restored current print spool from "
-                    f"Slot 1 → {slot_one_spool}"
-                )
-
         if print_ending:
             self._tracked_print_filename = ""
             if self._print_metadata_task and not self._print_metadata_task.done():
@@ -942,9 +1008,16 @@ class CC2Connection(PrinterConnection):
             "SpeedFactor":      round(speed_factor * 100),
         }
 
-        # Expose canvas tray info so the browser can render filament slots
+        # Expose and synchronize tray mappings only after the protocol has
+        # confirmed physical Canvas trays.  Empty canvas_info is normal on a
+        # single-material printer and must keep its regular spool UI intact.
         ci = s.get("canvas_info", {})
-        if ci:
+        if self._has_canvas():
+            if not self._canvas_locations_synced:
+                self._canvas_locations_synced = True
+                asyncio.get_running_loop().run_in_executor(
+                    None, self._sync_spoolman_locations,
+                )
             self.status["canvas_info"] = ci
             active_tray = ci.get("active_tray_id", -1)
             if active_tray != self._prev_active_tray_id:
