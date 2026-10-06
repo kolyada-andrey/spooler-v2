@@ -127,15 +127,21 @@ def test_camera_connected_stays_unknown_without_external_device(printer):
 
 # ── Canvas detection and spool mapping ──────────────────────────────────────
 
-def test_has_canvas_requires_a_reported_tray(printer):
+def test_has_canvas_requires_an_active_reported_tray(printer):
     assert not printer._has_canvas()
 
     printer._cc2_state["canvas_info"] = {"canvas_list": []}
     assert not printer._has_canvas()
 
+    # CC2 reports placeholder slots even with no physical Canvas.  An
+    # inactive tray ID must keep this printer in single-material mode.
     printer._cc2_state["canvas_info"] = {
+        "active_tray_id": -1,
         "canvas_list": [{"tray_list": [{"tray_id": 0}]}],
     }
+    assert not printer._has_canvas()
+
+    printer._cc2_state["canvas_info"]["active_tray_id"] = 0
     assert printer._has_canvas()
 
 

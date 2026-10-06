@@ -515,25 +515,41 @@ class CC2Connection(PrinterConnection):
                 spoolman_set_location(spool_id, self.id)
 
     def _has_canvas(self) -> bool:
-        """Return whether the printer has reported at least one Canvas tray.
+        """Return whether the printer has reported an active physical Canvas tray.
 
-        ``canvas_info`` itself is not evidence of a physical Canvas: firmware
-        can return an empty structure for single-material printers.  A tray
-        list is the protocol signal that makes tray-to-spool mapping safe.
+        The firmware exposes four placeholder slots even when no Canvas is
+        installed.  Those slots are indistinguishable by shape alone, but the
+        printer leaves ``active_tray_id`` at -1.  Require a non-negative
+        active tray that exists in the reported list before treating it as
+        Canvas telemetry.
         """
         canvas_info = self._cc2_state.get("canvas_info")
         if not isinstance(canvas_info, dict):
             return False
+        try:
+            active_tray_id = int(canvas_info.get("active_tray_id", -1))
+        except (TypeError, ValueError):
+            return False
+        if active_tray_id < 0:
+            return False
         canvas_list = canvas_info.get("canvas_list")
-        return (
-            isinstance(canvas_list, list)
-            and any(
-                isinstance(canvas, dict)
-                and isinstance(canvas.get("tray_list"), list)
-                and canvas["tray_list"]
-                for canvas in canvas_list
-            )
-        )
+        if not isinstance(canvas_list, list):
+            return False
+        for canvas in canvas_list:
+            if not isinstance(canvas, dict):
+                continue
+            trays = canvas.get("tray_list")
+            if not isinstance(trays, list):
+                continue
+            for tray in trays:
+                if not isinstance(tray, dict):
+                    continue
+                try:
+                    if int(tray.get("tray_id", -1)) == active_tray_id:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        return False
 
     def _protocol_reason_hint(self) -> dict | None:
         # Most error_code values aren't verified against real hardware yet —
