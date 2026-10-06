@@ -11,8 +11,9 @@ import uuid
 from pathlib import Path
 
 import state
-from persistence import save_tray_map
+from persistence import dump_raw_message, save_tray_map
 from printers.base import PrinterConnection
+from printers.error_codes import lookup as lookup_error_code
 from spoolman import (
     infer_material_from_name,
     parse_cc2_filename,
@@ -65,6 +66,8 @@ _CC2_STATE_KEYS = {
     "canvas", "canvas_info", "channel_info", "channels",
     "filament", "filament_info", "extruder_filament",
     "mmu", "ams",
+    # Device attributes (method 1001 response)
+    "software_version",
 }
 
 
@@ -255,6 +258,7 @@ class CC2Connection(PrinterConnection):
 
     async def _handle_mqtt_message(self, message) -> None:
         topic = str(message.topic)
+        dump_raw_message(self.id, f"cc2_mqtt:{topic}", message.payload)
 
         # Registration is deliberately gated on a live status message from the
         # current MQTT session.  This applies to both cached and newly
@@ -283,6 +287,7 @@ class CC2Connection(PrinterConnection):
                     self.connected = True
                     print(f"[Printer {self.name}] CC2 registered OK — ready")
                     await self._broadcast_state()
+                    await self.send_cmd(1001)  # device attributes (model/firmware/sn)
                     await self.send_cmd(1002)  # full state
                     await self.send_cmd(1003)  # machine_status
                     await self.send_cmd(1042)  # camera URL
@@ -400,12 +405,26 @@ class CC2Connection(PrinterConnection):
             # Strip stale filament_used from the 1002 full-state snapshot
             if inner is not None and isinstance(updates.get("print_status"), dict):
                 updates["print_status"].pop("filament_used", None)
+            # error_code is a scalar, not one of _CC2_STATE_KEYS's dict values,
+            # so the comprehension above skips it — capture it separately so
+            # it isn't silently dropped (previously it was excluded from the
+            # "unknown keys" debug warning above but never actually stored
+            # anywhere).
+            if "error_code" in source:
+                self._cc2_state["error_code"] = source["error_code"]
+            # machine_model/sn/hostname are scalars from method 1001's response,
+            # same "not a dict so the comprehension above skips it" situation
+            # as error_code.
+            for key in ("machine_model", "sn", "hostname"):
+                if key in source:
+                    self._cc2_state[key] = source[key]
             if updates:
                 deep_merge(self._cc2_state, updates)
                 self._apply_cc2_status()
-                # Polling replies carry the same state as api_status pushes.
-                # Account for their transitions too, otherwise an ended print
-                # can be visible in the UI but never reach history/deduction.
+                # This is the 5s status poller's method 1003 response, not the
+                # printer's unsolicited api_status push handled below — it still
+                # carries fresh print_status, so transitions must be checked
+                # here too or a print start/end seen only via polling is missed.
                 await self._check_print_transition()
                 await self._broadcast_state()
             return
@@ -485,6 +504,23 @@ class CC2Connection(PrinterConnection):
         for spool_id in (state.tray_map.get(self.id) or {}).values():
             if spool_id is not None:
                 spoolman_set_location(spool_id, self.id)
+
+    def _protocol_reason_hint(self) -> dict | None:
+        # Most error_code values aren't verified against real hardware yet —
+        # only codes present in printers/error_codes.py have a confirmed
+        # category/message; everything else surfaces raw with "unknown"
+        # rather than guessing.
+        error_code = self._cc2_state.get("error_code")
+        sub_status = self._cc2_state.get("machine_status", {}).get("sub_status")
+        if not error_code:
+            return None
+        known = lookup_error_code(error_code)
+        return {
+            "code":     error_code,
+            "category": known["category"] if known else "unknown",
+            "message":  known["message"] if known else "",
+            "raw":      {"error_code": error_code, "sub_status": sub_status},
+        }
 
     async def _file_list_timeout(self) -> None:
         await asyncio.sleep(10)
@@ -714,6 +750,21 @@ class CC2Connection(PrinterConnection):
         ztemp = s.get("ztemperature_sensor", {})
         ms    = s.get("machine_status", {})
 
+        # Device attributes (method 1001) -- same self.attrs shape CC1 already
+        # populates, so the existing "fw {version}" subtitle in the frontend
+        # just works for CC2 too. Verified live against real hardware
+        # (2026-10-05): software_version.ota_version is the user-facing
+        # firmware version shown on Elegoo's own app; mcu_version/soc_version
+        # exist but aren't what "firmware version" means to a user here.
+        sw_version = s.get("software_version")
+        if s.get("machine_model") or sw_version or s.get("sn") or s.get("hostname"):
+            self.attrs = {
+                "Model":           s.get("machine_model", self.attrs.get("Model", "")),
+                "FirmwareVersion": (sw_version or {}).get("ota_version", self.attrs.get("FirmwareVersion", "")),
+                "MainboardID":     s.get("sn", self.attrs.get("MainboardID", "")),
+                "Hostname":        s.get("hostname", self.attrs.get("Hostname", "")),
+            }
+
         print_duration = ps.get("print_duration", 0) or 0
         remaining      = ps.get("remaining_time_sec", 0) or 0
         state_str      = ps.get("state", "")
@@ -723,9 +774,32 @@ class CC2Connection(PrinterConnection):
             self._current_filename = filename_from_ps
         sub_status     = ms.get("sub_status", 0)
 
+        # external_device.camera -- verified against Elegoo's elegoo-link SDK
+        # (externalDeviceStatus.cameraConnected) as the printer's own signal
+        # for whether a camera module is physically connected right now.
+        # Only set when the printer has actually reported this key at least
+        # once; stays None (unknown) otherwise rather than defaulting to
+        # "disconnected" on a guess.
+        ext_device = s.get("external_device")
+        if isinstance(ext_device, dict) and "camera" in ext_device:
+            self.camera_connected = bool(ext_device["camera"])
+
+        # sub_status numbers verified against Elegoo's own open-source network SDK
+        # (github.com/elegooofficial/elegoo-link,
+        # src/lan/adapters/elegoo_fdm_cc2/elegoo_fdm_cc2_message_adapter.cpp's
+        # machine_status.sub_status switch) -- not guessed. That SDK observes
+        # 2801/2802 (homing) and 2901/2902 (auto-leveling) alongside its own
+        # top-level status==PRINTING, i.e. during a print's pre-print phase --
+        # we don't read that top-level status field ourselves, but placing
+        # them in _SUB_STABLE follows the exact same pattern already verified
+        # correct for the sibling preheating codes below (which only take
+        # effect when our own print_status.state string doesn't already say
+        # "printing", i.e. before the print has actually started extruding).
         _SUB_TRANSIENT = {2501: 5, 2503: 7}
         _SUB_STABLE    = {
-            1045: 15, 1096: 15, 1405: 15,
+            1045: 15, 1096: 15, 1405: 15, 1906: 15,  # extruder/bed preheating
+            2801: 1,  2802: 1,                       # homing
+            2901: 20, 2902: 20,                      # auto-leveling
             2075: 3,  2401: 3,  2402: 3,
             2077: 9,
             2502: 6,  2505: 6,

@@ -1,11 +1,31 @@
 /* Spooler – frontend app.js */
 "use strict";
 
-const WS_URL  = location.protocol === "https:"
-  ? `wss://${location.hostname}:${window.SPOOLER_WSS_PORT ?? 8766}`
-  : `ws://${location.hostname}:${window.SPOOLER_WS_PORT ?? 8765}`;
+// The backend also accepts WebSocket upgrades on the plain HTTP port itself
+// ("combo" mode), so by default we just reconnect to the page's own origin
+// (same hostname + port) — this is what makes Spooler work through a
+// single-port tunnel/reverse proxy (e.g. Cloudflare Tunnel → http://ip:8080)
+// with zero extra config: Cloudflare always presents the browser with the
+// standard port (443, so location.port is blank) and forwards the upgrade
+// through the same route as regular HTTP.
+//
+// The one case that still needs a separate port is a *direct* HTTPS
+// connection to Spooler's own self-signed listener (HTTPS_PORT, e.g. LAN PWA
+// installs) — TLS has to be terminated before the request line is even
+// visible, so that path can't be combo'd and keeps using WSS_PORT.
+//
+// SPOOLER_WS_HOST (WS_HOST env var) forces a specific host for edge cases
+// (e.g. running HTTPS_PORT=443 directly with no reverse proxy in front).
+const _directHttpsPort = location.protocol === "https:" && location.port && location.port !== "443";
+let WS_URL;
+if (window.SPOOLER_WS_HOST) {
+  WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + window.SPOOLER_WS_HOST;
+} else if (_directHttpsPort) {
+  WS_URL = `wss://${location.hostname}:${window.SPOOLER_WSS_PORT ?? 8766}`;
+} else {
+  WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+}
 const SPOOLMAN_URL = "/api/spoolman/api/v1";
-const RECONNECT_DELAY = 3000;
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
 (function () {
@@ -30,6 +50,13 @@ let history  = []; // print history log
 let spools   = []; // spool inventory from Spoolman
 let trayMap  = {}; // printer_id → { tray_id_str → spoolman_spool_id }
 let _prevActiveTray = {}; // printer_id → last seen active_tray_id
+let features = {}; // key → {name, description, enabled, locked, missing, risky, requires}
+
+function featureEnabled(key) {
+  // Unknown/not-yet-loaded features default to on so the UI doesn't flash
+  // hidden-then-shown while /api/features is still loading on first paint.
+  return features[key] ? features[key].enabled : true;
+}
 
 // ─── Spoolman field helpers ────────────────────────────────────────────────────
 function spoolName(s)       { return [s.filament?.vendor?.name, s.filament?.material, s.filament?.name].filter(Boolean).join(" ") || `Spool ${s.id}`; }
@@ -92,11 +119,34 @@ async function loadFilamentMeta() {
 }
 
 // ─── WebSocket connection ──────────────────────────────────────────────────────
+// Exponential backoff instead of a fixed delay — reconnecting instantly in a
+// tight loop against a server that's actually down just adds load for no
+// benefit; reconnecting fast is far more useful in the common case (a brief
+// network blip), so the delay starts short and only grows if it keeps failing.
+const RECONNECT_DELAYS = [1000, 2000, 5000, 10000, 30000];
+let _reconnectAttempt = 0;
+let _reconnectTimer = null;
+
+function _showConnBanner() {
+  document.getElementById("conn-banner").hidden = false;
+  document.body.classList.add("ws-disconnected");
+}
+function _hideConnBanner() {
+  document.getElementById("conn-banner").hidden = true;
+  document.body.classList.remove("ws-disconnected");
+}
+
 function connect() {
+  clearTimeout(_reconnectTimer);
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
     console.log("[WS] Connected");
+    _reconnectAttempt = 0;
+    _hideConnBanner();
+    // Always re-fetch full state on (re)connect, not just the initial load —
+    // whatever happened while disconnected (printer events we never saw)
+    // must not linger as stale data once the connection is back.
     send({ action: "list_printers" });
     loadHistory();
     fetchSpools();
@@ -113,7 +163,10 @@ function connect() {
   ws.onclose = (ev) => {
     if (ev.code === 1008) { location.replace("/login"); return; }
     console.warn("[WS] Disconnected, retrying…");
-    setTimeout(connect, RECONNECT_DELAY);
+    _showConnBanner();
+    const delay = RECONNECT_DELAYS[Math.min(_reconnectAttempt, RECONNECT_DELAYS.length - 1)];
+    _reconnectAttempt++;
+    _reconnectTimer = setTimeout(connect, delay);
   };
 
   ws.onerror = () => ws.close();
@@ -124,6 +177,22 @@ function send(obj) {
     ws.send(JSON.stringify(obj));
   }
 }
+
+// Mobile browsers routinely kill WebSockets while a tab/PWA is backgrounded.
+// Don't wait for the next scheduled reconnect (which could be up to 30s into
+// an already-stale backoff) once the user actually comes back to look at it.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    _reconnectAttempt = 0;
+    clearTimeout(_reconnectTimer);
+    connect();
+  } else if (ws.readyState === WebSocket.OPEN) {
+    send({ action: "list_printers" });
+    loadHistory();
+    fetchSpools();
+  }
+});
 
 // ─── Message handling ──────────────────────────────────────────────────────────
 function handleMessage(msg) {
@@ -184,6 +253,9 @@ function handleMessage(msg) {
         }, 12000);
       }
       break;
+    case "features_changed":
+      _applyFeatures(msg.features || []);
+      break;
   }
 }
 
@@ -203,61 +275,54 @@ function _checkActiveTrayChange(printer) {
 }
 
 // ─── Status helpers ────────────────────────────────────────────────────────────
-// PrintInfo.Status codes (from CarbonicSidecar / elegoo-homeassistant)
-const PRINT_STATUS = {
-  0:  "idle",
-  1:  "homing",
-  2:  "printing",    // bed dropping
-  3:  "printing",
-  4:  "printing",    // lifting
-  5:  "pausing",
-  6:  "paused",
-  7:  "stopping",
-  8:  "cancelled",
-  9:  "complete",
-  10: "checking",
-  12: "recovering",
-  13: "printing",    // printing (recovery)
-  14: "cancelled",
-  15: "warming up",
-  16: "warming up",  // preheating
-  18: "warming up",
-  19: "warming up",
-  20: "leveling",
-  21: "warming up",
-};
-
-// CurrentStatus[0] codes (machine-level state)
-const MACHINE_STATUS = {
-  0: "idle", 1: "printing", 2: "transferring", 3: "testing",
-  4: "testing", 5: "leveling", 6: "tuning", 7: "stopping",
-  8: "stopped", 9: "homing", 10: "loading", 11: "tuning", 12: "recovering",
+// The backend's PrinterConnection.to_dict() already normalizes every
+// protocol's raw status codes into a single small vocabulary (see
+// printers/base.py classify_display_state): offline, idle, preparing,
+// printing, pausing, paused, complete, cancelled, stopping, error, unknown.
+// The dot and badge both read that same "state" string directly — no more
+// separate raw-code interpretation here, so they can never disagree with
+// each other or with the backend's own notion of what's happening.
+const STATE_LABEL = {
+  offline:   "Offline",
+  idle:      "Idle",
+  preparing: "Preparing",
+  printing:  "Printing",
+  pausing:   "Pausing",
+  paused:    "Paused",
+  complete:  "Complete",
+  cancelled: "Cancelled",
+  stopping:  "Stopping",
+  error:     "Error",
+  unknown:   "Unknown status",
 };
 
 function getPrintStatus(printer) {
-  if (!printer.connected) return "offline";
-  const pi = printer.status?.PrintInfo;
-  const code = pi?.Status;
-  if (code === undefined || code === null) return "idle";
-  // Special case: CurrentStatus[0] === 9 means homing (between prints)
-  const machineCode = printer.status?.CurrentStatus?.[0];
-  if (machineCode === 9 && code === 0) return "homing";
-  return PRINT_STATUS[code] ?? "idle";
+  return printer.state || (printer.connected ? "idle" : "offline");
 }
 
 function statusClass(s) {
-  if (["printing", "homing", "recovering"].includes(s))        return "printing";
-  if (["warming up", "leveling", "checking"].includes(s))      return "warmingup";
-  if (["pausing", "paused"].includes(s))                       return "paused";
-  if (["stopping", "cancelled"].includes(s))                   return "cancelled";
-  if (s === "complete")                                         return "complete";
-  if (s === "offline")                                          return "offline";
-  return "idle";
+  return STATE_LABEL[s] ? s : "idle";
 }
 
 function isActivelyPrinting(printer) {
   const s = getPrintStatus(printer);
-  return ["printing", "homing", "warming up", "leveling", "checking", "recovering"].includes(s);
+  return ["printing", "preparing"].includes(s);
+}
+
+// Data goes stale faster while actively printing (30s) than otherwise (2min)
+// -- a frozen temperature reading matters a lot more mid-print than while idle.
+function isStale(printer) {
+  if (!printer.connected || printer.last_seen == null) return false; // offline is its own distinct state
+  const thresholdS = isActivelyPrinting(printer) ? 30 : 120;
+  return (Date.now() / 1000 - printer.last_seen) > thresholdS;
+}
+
+function formatAgo(epochSeconds) {
+  const diff = Math.max(0, Math.round(Date.now() / 1000 - epochSeconds));
+  if (diff < 60) return `${diff}s ago`;
+  const mins = Math.round(diff / 60);
+  if (mins < 60) return `${mins}m ago`;
+  return `${Math.round(mins / 60)}h ago`;
 }
 
 // Returns the printer object that currently has this spool loaded as its active tray, or null.
@@ -274,6 +339,50 @@ function getSpoolActivePrinter(spoolId) {
 function isPaused(printer) {
   const s = getPrintStatus(printer);
   return ["paused", "pausing"].includes(s);
+}
+
+// Minimal reason box — full visual treatment (icons per category, etc.) is T3's
+// job; this just satisfies T2's "show why" requirement without guessing text
+// for anything not actually verified.
+const _REASON_KIND_LABEL = { pause: "Paused", stop: "Stopped", error: "Error" };
+const _REASON_CATEGORY_LABEL = {
+  filament_runout: "Filament runout",
+  nozzle_clog:     "Nozzle clog",
+  thermal:         "Thermal issue",
+  collision:       "Collision detected",
+  power_loss:      "Power loss",
+  door_open:       "Door open",
+  leveling:        "Leveling failed",
+  user:            "User action",
+  unknown:         "Reason not yet identified",
+};
+const _REASON_INITIATOR_LABEL = {
+  spooler: "from Spooler",
+  printer: "reported by printer",
+  unknown: "from printer screen, app, or unknown source",
+};
+
+function renderReasonBox(printer) {
+  const r = printer.state_reason;
+  if (!r) return "";
+  const kindLabel = _REASON_KIND_LABEL[r.kind] || "Notice";
+  const initiator = _REASON_INITIATOR_LABEL[r.initiated_by] || _REASON_INITIATOR_LABEL.unknown;
+  // A spooler-initiated pause/stop already has a known, obvious cause (someone
+  // clicked the button) — showing a generic "reason not yet identified" after
+  // it would be actively misleading, so only append category/message detail
+  // when there's something the printer/protocol actually reported.
+  const detail = r.initiated_by === "spooler"
+    ? (r.message || "")
+    : (r.message || _REASON_CATEGORY_LABEL[r.category] || _REASON_CATEGORY_LABEL.unknown);
+  return `
+    <div class="reason-box ${r.kind === "error" ? "reason-box-error" : ""}">
+      <div class="reason-box-main">
+        <strong>${escHtml(kindLabel)}</strong> ${escHtml(initiator)}
+        ${detail ? ` — ${escHtml(detail)}` : ""}
+      </div>
+      ${r.code ? `<div class="reason-box-code">Code: ${escHtml(String(r.code))}</div>` : ""}
+    </div>
+  `;
 }
 
 function getProgress(printer) {
@@ -309,6 +418,21 @@ function formatTimeLong(secs) {
   return `${String(h).padStart(2, "0")}h${String(m).padStart(2, "0")}m${String(s).padStart(2, "0")}s`;
 }
 
+// Manually formats hours/minutes (never via toLocaleTimeString) so the
+// result is always 24-hour regardless of the browser's locale.
+function formatFinishAt(remainingSecs) {
+  if (!remainingSecs || remainingSecs <= 0) return null;
+  const now    = new Date();
+  const finish = new Date(now.getTime() + remainingSecs * 1000);
+  const time   = `${String(finish.getHours()).padStart(2, "0")}:${String(finish.getMinutes()).padStart(2, "0")}`;
+  const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const daysAhead = Math.round((startOfDay(finish) - startOfDay(now)) / 86400000);
+  if (daysAhead <= 0) return `Done ~${time}`;
+  if (daysAhead === 1) return `Done tomorrow ${time}`;
+  const dateStr = finish.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return `Done ${dateStr}, ${time}`;
+}
+
 function tempColor(t) {
   if (!t) return "";
   if (t > 150) return "hot";
@@ -336,6 +460,8 @@ function renderPrinter(printer) {
   const printing = isActivelyPrinting(printer);
   const paused   = isPaused(printer);
   const connected = printer.connected;
+  const stale     = isStale(printer);
+  card.classList.toggle("card-stale", stale);
 
   const nozzle     = printer.status?.TempOfNozzle    ?? printer.status?.NozzleTemp    ?? 0;
   const nozzleTgt  = printer.status?.TempTargetNozzle?? printer.status?.NozzleTempTarget ?? 0;
@@ -350,7 +476,8 @@ function renderPrinter(printer) {
   const filamentG  = printer.filament_g  ?? 0;
   const lightOn    = getLightOn(printer);
 
-  const cameraUrl = printer.connected && printer.camera_url
+  const cameraUrl = printer.connected && printer.camera_url && featureEnabled("camera")
+                     && printer.camera_connected !== false
     ? `/api/camera/${encodeURIComponent(printer.id)}`
     : null;
 
@@ -358,21 +485,29 @@ function renderPrinter(printer) {
   // survives innerHTML replacement (every printer_update would kill it otherwise)
   const prevCameraImg = card.querySelector('.card-camera img');
 
+  const stateLabel = STATE_LABEL[sc] || STATE_LABEL.unknown;
+  const badgeText  = (sc === "error" && printer.state_reason?.code)
+    ? `${status} (${printer.state_reason.code})`
+    : status;
+
   card.innerHTML = `
     <!-- Header -->
     <div class="card-header">
-      <div class="status-dot ${sc}"></div>
+      <div class="status-dot ${sc}" role="img" aria-label="${escAttr(stateLabel)}" title="${escAttr(stateLabel)}"></div>
       <div class="card-header-info">
         <div class="card-title">${escHtml(printer.name)}</div>
         <div class="card-subtitle">${escHtml(printer.ip)}${printer.attrs?.FirmwareVersion ? ` · fw ${escHtml(printer.attrs.FirmwareVersion)}` : ""}</div>
       </div>
-      <span class="status-badge ${sc}">${status}</span>
+      <span class="status-badge ${sc}">${escHtml(badgeText)}</span>
       <button class="card-files-btn" onclick="openFileBrowser('${escAttr(printer.id)}')" title="Browse files">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
         </svg>
       </button>
     </div>
+
+    ${renderReasonBox(printer)}
+    ${stale ? `<div class="stale-notice">Last updated ${formatAgo(printer.last_seen)}</div>` : ""}
 
     <!-- Camera -->
     <div class="card-camera">
@@ -381,7 +516,7 @@ function renderPrinter(printer) {
           <path d="M23 7l-7 5 7 5V7z"/>
           <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
         </svg>
-        <span>${connected ? "No camera feed" : "Printer offline"}</span>
+        <span>${!connected ? "Printer offline" : printer.camera_connected === false ? "Camera not connected on printer" : "No camera feed"}</span>
       </div>
     </div>
 
@@ -399,6 +534,13 @@ function renderPrinter(printer) {
         <span>Elapsed: ${formatTime(elapsed)}</span>
         <span>Remaining: ${formatTime(remaining)}</span>
       </div>
+      ${paused
+        ? `<div class="finish-time">Paused — finish time updates when print resumes</div>`
+        : (() => {
+            const finishLabel = formatFinishAt(remaining);
+            return finishLabel ? `<div class="finish-time">${escHtml(finishLabel)}</div>` : "";
+          })()
+      }
       ${filamentMm > 0 ? `
       <div class="filament-info">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -452,7 +594,7 @@ function renderPrinter(printer) {
         const linkedChip = linkedSpool
           ? `<div class="canvas-tray-spool" title="${escAttr(spoolName(linkedSpool))}">
                <div class="canvas-tray-spool-dot" style="background:${escAttr(spoolColorHex(linkedSpool))}"></div>
-               <span>${escHtml(spoolName(linkedSpool).split(" ").slice(0,2).join(" "))}</span>
+               <span>${escHtml(spoolName(linkedSpool))}</span>
              </div>`
           : `<div class="canvas-tray-spool canvas-tray-spool-empty">No spool</div>`;
         return `<div class="canvas-tray${active ? " canvas-tray-active" : ""}"
@@ -512,9 +654,11 @@ function renderPrinter(printer) {
         </button>
       ` : ""}
       <div class="controls-spacer"></div>
-      <button class="btn btn-sm ${lightOn ? "btn-primary" : "btn-secondary"}"
+      <button class="btn btn-sm btn-secondary${lightOn ? " btn-light-on" : ""}"
               onclick="printerAction('${escAttr(printer.id)}','${lightOn ? "light_off" : "light_on"}')"
-              title=""
+              title="${lightOn ? "Light on" : "Light off"}"
+              aria-label="${lightOn ? "Light on" : "Light off"}"
+              aria-pressed="${lightOn}"
               ${!connected ? "disabled" : ""}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="5"/>
@@ -546,6 +690,7 @@ function renderPrinter(printer) {
         prevCameraImg.src = cameraUrl;
       }
       prevCameraImg._connected = connected;
+      prevCameraImg._baseUrl = cameraUrl;
       cameraDiv.insertBefore(prevCameraImg, cameraDiv.firstChild);
       placeholder.style.display = 'none';
       prevCameraImg.style.display = '';
@@ -554,10 +699,41 @@ function renderPrinter(printer) {
       img.src = cameraUrl;
       img.alt = 'Camera feed';
       img._connected = connected;
+      img._baseUrl = cameraUrl;
+      // Chrome/Chromium does not reliably re-fire "load" for each part of a
+      // multipart/x-mixed-replace MJPEG stream (only Firefox does), so load
+      // timing can't be used as a per-frame staleness signal across browsers
+      // -- it caused "Camera image not updated" to fire constantly on Chrome
+      // even while the stream was actively working. The "error" event still
+      // fires correctly when the stream genuinely drops, so that's all we
+      // rely on here.
       img.addEventListener('load',  () => { placeholder.style.display = 'none'; });
       img.addEventListener('error', () => { img.style.display = 'none'; placeholder.style.display = 'flex'; });
       cameraDiv.insertBefore(img, cameraDiv.firstChild);
     }
+  }
+
+  // Only CC2 currently reports LightStatus -- printers that never report it
+  // (CC1) must not show this, since getLightOn() falling back to "off" for
+  // them would make the overlay permanently cover a working camera feed.
+  const lightKnown = printer.status?.LightStatus != null;
+  let lightOverlay = cameraDiv.querySelector('.camera-light-overlay');
+  if (cameraUrl && connected && lightKnown && !lightOn) {
+    if (!lightOverlay) {
+      lightOverlay = document.createElement('div');
+      lightOverlay.className = 'camera-light-overlay';
+      lightOverlay.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="5"/>
+          <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+        <span>Light off</span>
+      `;
+      lightOverlay.addEventListener('click', () => printerAction(printer.id, 'light_on'));
+      cameraDiv.appendChild(lightOverlay);
+    }
+  } else if (lightOverlay) {
+    lightOverlay.remove();
   }
 }
 
@@ -655,8 +831,11 @@ const _settingsPwPage         = document.getElementById("settings-change-passwor
 const _settingsNotifPage      = document.getElementById("settings-notifications");
 const _settingsPrintersPage   = document.getElementById("settings-printers");
 const _settingsPrinterEditPage = document.getElementById("settings-printer-edit");
+const _settingsBackupPage     = document.getElementById("settings-backup");
+const _settingsFeaturesPage   = document.getElementById("settings-features");
+const _settingsIntegrationsPage = document.getElementById("settings-integrations");
 
-const _allSettingsPages = () => [_settingsPwPage, _settingsNotifPage, _settingsPrintersPage, _settingsPrinterEditPage];
+const _allSettingsPages = () => [_settingsPwPage, _settingsNotifPage, _settingsPrintersPage, _settingsPrinterEditPage, _settingsBackupPage, _settingsFeaturesPage, _settingsIntegrationsPage];
 
 function _openSettings() {
   _allSettingsPages().forEach(p => p && (p.style.display = "none"));
@@ -926,6 +1105,118 @@ document.getElementById("btn-settings-goto-notifications")?.addEventListener("cl
   _showSettingsPage(_settingsNotifPage);
 });
 document.getElementById("btn-settings-back-notif")?.addEventListener("click", _backToSettingsMenu);
+
+// ─── Backup / restore ───────────────────────────────────────────────────────
+async function _renderAutoBackupList() {
+  const list = document.getElementById("backup-auto-list");
+  if (!list) return;
+  list.innerHTML = '<span class="backup-auto-empty">Loading…</span>';
+  try {
+    const r = await fetch("/api/backups");
+    const backups = r.ok ? await r.json() : [];
+    if (!backups.length) {
+      list.innerHTML = '<span class="backup-auto-empty">No automatic backups yet.</span>';
+      return;
+    }
+    list.innerHTML = backups.map(b => {
+      const date = new Date(b.modified * 1000).toLocaleString();
+      const kb   = (b.size / 1024).toFixed(0);
+      return `<div class="backup-auto-row">
+        <span>${escHtml(date)} · ${kb} KB</span>
+        <a href="/api/backups/${encodeURIComponent(b.name)}" class="btn btn-secondary btn-sm">Download</a>
+      </div>`;
+    }).join("");
+  } catch (_) {
+    list.innerHTML = '<span class="backup-auto-empty">Could not load backups.</span>';
+  }
+}
+
+function _populateBackupIntervalField() {
+  const input = document.getElementById("backup-interval-days");
+  if (!input) return;
+  const field = integrations.fields.find(f => f.key === "backup.interval_days");
+  input.value = field ? field.value : 1;
+}
+
+document.getElementById("btn-settings-goto-backup")?.addEventListener("click", async () => {
+  _showSettingsPage(_settingsBackupPage);
+  _renderAutoBackupList();
+  await loadIntegrations();
+  _populateBackupIntervalField();
+});
+document.getElementById("btn-settings-back-backup")?.addEventListener("click", _backToSettingsMenu);
+
+document.getElementById("btn-backup-interval-save")?.addEventListener("click", async () => {
+  const input = document.getElementById("backup-interval-days");
+  const days = parseInt(input.value, 10);
+  if (isNaN(days) || days < 0) {
+    toast("Enter a number of days (0 or more)", true);
+    return;
+  }
+  try {
+    const r = await fetch("/api/integrations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values: { "backup.interval_days": days } }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      toast(data.error || "Could not save interval", true);
+      return;
+    }
+    toast(days === 0 ? "Automatic backups disabled" : `Interval set to ${days} day(s)`);
+  } catch (e) {
+    toast("Could not save interval: " + e.message, true);
+  }
+});
+
+document.getElementById("btn-settings-goto-features")?.addEventListener("click", () => {
+  _showSettingsPage(_settingsFeaturesPage);
+  _renderFeaturesList();
+});
+document.getElementById("btn-settings-back-features")?.addEventListener("click", _backToSettingsMenu);
+
+document.getElementById("btn-settings-goto-integrations")?.addEventListener("click", () => {
+  _showSettingsPage(_settingsIntegrationsPage);
+  _renderIntegrationsList();
+  _renderServerSettings();
+});
+document.getElementById("btn-settings-back-integrations")?.addEventListener("click", _backToSettingsMenu);
+
+document.getElementById("btn-backup-download")?.addEventListener("click", () => {
+  const includeSecrets = document.getElementById("backup-include-secrets")?.checked;
+  const url = `/api/backup${includeSecrets ? "?include_secrets=1" : ""}`;
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
+
+document.getElementById("btn-backup-restore")?.addEventListener("click", async () => {
+  const input = document.getElementById("backup-restore-file");
+  const file = input?.files?.[0];
+  if (!file) {
+    toast("Choose a backup file first");
+    return;
+  }
+  if (!confirm("This overwrites current printers, history and settings with the contents of this backup, and restarts Spooler. Continue?")) {
+    return;
+  }
+  try {
+    const r = await fetch("/api/restore", { method: "POST", body: file });
+    const data = await r.json();
+    if (!r.ok) {
+      toast(data.error || "Restore failed", true);
+      return;
+    }
+    toast(data.message || "Restored — reloading…");
+    setTimeout(() => location.reload(), 4000);
+  } catch (e) {
+    toast("Restore failed: " + e.message, true);
+  }
+});
 document.getElementById("btn-notif-save")?.addEventListener("click", async () => {
   const gb = id => document.getElementById(id)?.checked ?? false;
   const gv = id => parseFloat(document.getElementById(id)?.value) || 0;
@@ -1364,6 +1655,271 @@ async function loadHistory() {
   } catch (e) { /* server may not be ready yet */ }
 }
 
+// ─── Feature flags ───────────────────────────────────────────────────────────
+async function loadFeatures() {
+  try {
+    const r = await fetch("/api/features");
+    if (r.ok) _applyFeatures(await r.json());
+  } catch (e) { /* server may not be ready yet */ }
+}
+
+// ─── Integrations config (T8) ────────────────────────────────────────────────
+let integrations = { fields: [], tests: {}, server_settings: {} };
+
+function integrationField(key) {
+  return integrations.fields.find(f => f.key === key);
+}
+
+async function loadIntegrations() {
+  try {
+    const r = await fetch("/api/integrations");
+    if (!r.ok) return;
+    integrations = await r.json();
+    const slicerUrl = integrationField("slicer.url")?.value || "";
+    const slicerBtn = document.getElementById("btn-slicer");
+    if (slicerBtn) {
+      slicerBtn.hidden = !slicerUrl;
+      if (slicerUrl) slicerBtn.href = slicerUrl;
+    }
+    if (_settingsIntegrationsPage && _settingsIntegrationsPage.style.display !== "none") {
+      _renderIntegrationsList();
+    }
+  } catch (e) { /* server may not be ready yet */ }
+}
+
+const _INTEGRATION_GROUPS = [
+  { title: "Spoolman", prefix: "spoolman.", testKey: "spoolman" },
+  { title: "Slicer",   prefix: "slicer.",   testKey: null },
+];
+
+function _renderIntegrationsList() {
+  const container = document.getElementById("integrations-list");
+  if (!container) return;
+
+  container.innerHTML = _INTEGRATION_GROUPS.map(group => {
+    const fields = integrations.fields.filter(f => f.key.startsWith(group.prefix));
+    if (!fields.length) return "";
+    const test = group.testKey ? integrations.tests[group.testKey] : null;
+
+    const fieldsHtml = fields.map(f => {
+      const sourceLabel = f.source === "env" ? "from environment variable"
+                         : f.source === "ui"  ? "custom"
+                         : "default";
+      const lockedNote = f.locked
+        ? `<div class="integration-locked-note">Locked by server configuration</div>` : "";
+
+      if (f.type === "bool") {
+        return `
+          <div class="integration-field">
+            <div style="display:flex;align-items:center;gap:10px;justify-content:space-between">
+              <span>${escHtml(f.label)}</span>
+              <label class="toggle-switch">
+                <input type="checkbox" data-config-key="${escAttr(f.key)}"
+                       ${f.value ? "checked" : ""} ${f.locked ? "disabled" : ""} />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="integration-field-meta"><span class="integration-source-badge">${escHtml(sourceLabel)}</span></div>
+            ${lockedNote}
+          </div>`;
+      }
+
+      const inputType = f.type === "secret" ? "password" : f.type === "int" ? "number" : "text";
+      const placeholder = f.type === "secret" ? (f.set ? "•••• (leave blank to keep)" : "Not set") : "";
+      const value = f.type === "secret" ? "" : escAttr(f.value ?? "");
+      const removeBtn = (f.type === "secret" && f.set)
+        ? `<button type="button" class="btn btn-secondary btn-sm" data-clear-key="${escAttr(f.key)}">Remove</button>` : "";
+      return `
+        <div class="integration-field">
+          <label>${escHtml(f.label)}
+            <input type="${inputType}" data-config-key="${escAttr(f.key)}" value="${value}"
+                   placeholder="${escAttr(placeholder)}" ${f.locked ? "disabled" : ""} />
+          </label>
+          <div class="integration-field-meta">
+            <span class="integration-source-badge">${escHtml(sourceLabel)}</span>
+            ${removeBtn}
+          </div>
+          ${lockedNote}
+        </div>`;
+    }).join("");
+
+    const testHtml = group.testKey ? `
+      <div class="integration-test-row">
+        <button type="button" class="btn btn-secondary btn-sm" data-test-key="${escAttr(group.testKey)}">Test connection</button>
+        ${test ? `<span class="integration-test-result ${test.ok ? "ok" : "fail"}">${escHtml(test.message)}</span>` : ""}
+      </div>` : "";
+
+    return `
+      <details class="integration-group" open>
+        <summary>${escHtml(group.title)}</summary>
+        <div class="integration-group-body">${fieldsHtml}${testHtml}</div>
+      </details>`;
+  }).join("");
+
+  container.querySelectorAll("button[data-test-key]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const key = btn.dataset.testKey;
+      btn.disabled = true;
+      btn.textContent = "Testing…";
+      try {
+        const r = await fetch(`/api/integrations/${encodeURIComponent(key)}/test`, { method: "POST" });
+        integrations.tests[key] = await r.json();
+      } catch (e) {
+        integrations.tests[key] = { ok: false, message: e.message };
+      }
+      _renderIntegrationsList();
+    });
+  });
+
+  container.querySelectorAll("button[data-clear-key]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const key = btn.dataset.clearKey;
+      try {
+        const r = await fetch("/api/integrations", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clear: [key] }),
+        });
+        const data = await r.json();
+        if (!r.ok) { toast(data.error || "Could not clear field", true); return; }
+        integrations.fields = data.fields;
+        _renderIntegrationsList();
+        toast("Cleared");
+      } catch (e) {
+        toast("Could not clear field: " + e.message, true);
+      }
+    });
+  });
+}
+
+function _renderServerSettings() {
+  const el = document.getElementById("integrations-server-settings-list");
+  if (!el) return;
+  const s = integrations.server_settings || {};
+  el.innerHTML = Object.entries(s)
+    .map(([k, v]) => `<span>${escHtml(k)}</span><b>${escHtml(String(v))}</b>`)
+    .join("");
+}
+
+document.getElementById("btn-integrations-save")?.addEventListener("click", async () => {
+  const values = {};
+  document.querySelectorAll("#integrations-list [data-config-key]").forEach(input => {
+    const key = input.dataset.configKey;
+    values[key] = input.type === "checkbox" ? input.checked : input.value;
+  });
+  try {
+    const r = await fetch("/api/integrations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      toast(data.error || "Could not save", true);
+      return;
+    }
+    toast("Saved");
+    await loadIntegrations();
+    _renderIntegrationsList();
+  } catch (e) {
+    toast("Could not save: " + e.message, true);
+  }
+});
+
+// Settings menu items (and their sub-pages) that hide entirely when their
+// feature is off, instead of just rejecting on the server -- so the user
+// never sees a settings entry for something that's been switched off.
+const _GATED_SETTINGS_PAGES = [
+  { feature: "backup",        btnId: "btn-settings-goto-backup",        page: () => _settingsBackupPage },
+  { feature: "notifications", btnId: "btn-settings-goto-notifications", page: () => _settingsNotifPage },
+];
+
+function _applyFeatures(list) {
+  features = {};
+  list.forEach(f => { features[f.key] = f; });
+  Object.values(printers).forEach(renderPrinter);
+  const spoolsBtn = document.getElementById("btn-spools");
+  if (spoolsBtn) spoolsBtn.style.display = featureEnabled("spoolman") ? "" : "none";
+
+  _GATED_SETTINGS_PAGES.forEach(({ feature, btnId, page }) => {
+    const btn = document.getElementById(btnId);
+    const enabled = featureEnabled(feature);
+    if (btn) btn.style.display = enabled ? "" : "none";
+    // If that page is open when its feature gets turned off (e.g. toggled
+    // from another tab), don't leave the user stranded on a now-hidden page.
+    const pageEl = page();
+    if (!enabled && pageEl && pageEl.style.display !== "none") {
+      _backToSettingsMenu();
+    }
+  });
+
+  if (_settingsFeaturesPage && _settingsFeaturesPage.style.display !== "none") {
+    _renderFeaturesList();
+  }
+}
+
+const _FEATURE_GROUPS = [
+  { title: "Monitoring",    keys: ["camera"] },
+  { title: "Notifications", keys: ["notifications", "notify_webpush"] },
+  { title: "Data",          keys: ["backup"] },
+  { title: "Integrations",  keys: ["spoolman"] },
+];
+
+function _renderFeaturesList() {
+  const container = document.getElementById("features-list");
+  if (!container) return;
+  container.innerHTML = _FEATURE_GROUPS.map(group => {
+    const rows = group.keys.filter(k => features[k]).map(key => {
+      const f = features[key];
+      const lockedNote = f.locked
+        ? `<div class="feature-locked-note">Locked off by server configuration</div>`
+        : "";
+      return `
+        <div class="feature-row">
+          <div class="feature-info">
+            <span class="feature-label">${escHtml(f.name)}</span>
+            <span class="feature-desc">${escHtml(f.description)}</span>
+            ${lockedNote}
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" data-feature-key="${escAttr(key)}"
+                   ${f.enabled ? "checked" : ""} ${f.locked ? "disabled" : ""} />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>`;
+    }).join("");
+    return rows ? `<div class="feature-group-title">${escHtml(group.title)}</div>${rows}` : "";
+  }).join("");
+
+  container.querySelectorAll("input[data-feature-key]").forEach(input => {
+    input.addEventListener("change", async () => {
+      const key = input.dataset.featureKey;
+      const enabled = input.checked;
+      if (enabled && features[key]?.risky && !confirm(`${features[key].name} is marked risky. Enable it?`)) {
+        input.checked = false;
+        return;
+      }
+      try {
+        const r = await fetch("/api/features", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key, enabled }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          toast(data.error || "Could not update feature", true);
+          input.checked = !enabled;
+          return;
+        }
+        _applyFeatures(data.features);
+      } catch (e) {
+        toast("Could not update feature: " + e.message, true);
+        input.checked = !enabled;
+      }
+    });
+  });
+}
+
 function renderHistory() {
   const tbody  = document.getElementById("history-tbody");
   const empty  = document.getElementById("history-empty");
@@ -1389,9 +1945,19 @@ function renderHistory() {
   tbody.innerHTML = history.map(e => {
     const date   = e.timestamp.replace("T", " ").slice(0, 16);
     const m      = (e.filament_mm / 1000).toFixed(2);
-    const result = e.completed === false
-      ? `<span style="color:var(--red);font-size:11px">cancelled</span>`
-      : `<span style="color:var(--green);font-size:11px">done</span>`;
+    // end_state/error_code/error_message/stop_reason are new fields (T2) —
+    // older history entries won't have them, so fall back to the original
+    // completed-only distinction for those.
+    let result;
+    if (e.end_state === "error") {
+      const detail = e.error_message || e.stop_reason || "";
+      result = `<span style="color:var(--red);font-size:11px"${detail ? ` title="${escAttr(detail)}"` : ""}>error${e.error_code ? ` (${escHtml(String(e.error_code))})` : ""}</span>`;
+    } else if (e.end_state === "cancelled" || (e.end_state === undefined && e.completed === false)) {
+      const detail = e.stop_reason && e.stop_reason !== "unknown" ? e.stop_reason : "";
+      result = `<span style="color:var(--red);font-size:11px"${detail ? ` title="${escAttr(detail)}"` : ""}>cancelled</span>`;
+    } else {
+      result = `<span style="color:var(--green);font-size:11px">done</span>`;
+    }
     return `<tr>
       <td class="col-date">${escHtml(date)}</td>
       <td>${escHtml(e.printer_name)}</td>
@@ -1995,15 +2561,68 @@ document.getElementById("modal-changelog")?.addEventListener("click", e => {
     e.target.classList.remove("open");
 });
 
+// ─── Demo mode (?demo=states) ───────────────────────────────────────────────────
+// One synthetic card per state, side by side — lets anyone sanity-check every
+// status dot/badge/reason-box combination at once without needing a printer
+// in every possible state. No WebSocket connection is made in this mode.
+function renderDemoStates() {
+  const reasonFor = (s) => {
+    if (s === "error") return { kind: "error", initiated_by: "printer", code: "99",
+                                 category: "unknown", message: "Demo error message" };
+    if (s === "pausing" || s === "paused") return { kind: "pause", initiated_by: "unknown",
+                                 code: "", category: "unknown", message: "" };
+    if (s === "cancelled" || s === "stopping") return { kind: "stop", initiated_by: "spooler",
+                                 code: "", category: "unknown", message: "" };
+    return null;
+  };
+  Object.keys(STATE_LABEL).forEach((s) => {
+    const p = {
+      id: `demo-${s}`, ip: "demo", name: `Demo: ${STATE_LABEL[s]}`,
+      printer_type: "cc1", connected: s !== "offline",
+      state: s, state_reason: reasonFor(s),
+      status: { PrintInfo: { Filename: "demo.gcode", CurrentLayer: 10, TotalLayer: 100,
+                              PrintTime: 600, RemainTime: 900, TotalExtrusion: 1200 } },
+      attrs: {}, camera_url: null, filament_mm: 1200, filament_g: 3.6, has_access_code: false,
+    };
+    printers[p.id] = p;
+    renderPrinter(p);
+  });
+}
+
+// Mobile browsers (notably when installed as a PWA) suspend the network
+// connection behind an MJPEG <img> while the app is backgrounded, and the
+// stream doesn't resume on its own since the <img> src never changes -- it
+// hangs showing the last frame (or the alt text) until something forces a
+// fresh request. Re-point every camera <img> at a cache-busted URL whenever
+// the app comes back to the foreground to force that reconnect.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  document.querySelectorAll('.card-camera img').forEach(img => {
+    if (!img._baseUrl) return;
+    const sep = img._baseUrl.includes('?') ? '&' : '?';
+    img.src = `${img._baseUrl}${sep}_r=${Date.now()}`;
+  });
+});
+
 // ─── Boot ──────────────────────────────────────────────────────────────────────
-fetch("/api/auth-status")
-  .then(r => r.json())
-  .then(({ spoolman_url }) => {
-    if (spoolman_url) document.getElementById("btn-spoolman-ui").href = spoolman_url;
-  })
-  .catch(() => {});
-loadChangelog();
-connect();
+if (new URLSearchParams(location.search).get("demo") === "states") {
+  renderDemoStates();
+} else {
+  fetch("/api/auth-status")
+    .then(r => r.json())
+    .then(({ spoolman_url }) => {
+      if (spoolman_url) document.getElementById("btn-spoolman-ui").href = spoolman_url;
+    })
+    .catch(() => {});
+  loadChangelog();
+  loadFeatures();
+  loadIntegrations();
+  connect();
+  // Staleness is purely a function of wall-clock time passing, not of new
+  // data arriving — a card can go stale with no new printer_update at all,
+  // so it needs its own tick independent of the WS message flow.
+  setInterval(() => Object.values(printers).forEach(renderPrinter), 10000);
+}
 
 // On startup: if notifications are enabled but the subscription was cleared by the
 // browser (e.g. after cache purge), silently re-subscribe so notifications keep working.

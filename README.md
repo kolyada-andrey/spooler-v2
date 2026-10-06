@@ -153,6 +153,17 @@ Printer configs are saved and reconnect automatically on restart.
 
 ---
 
+## Backup & restore
+
+Settings → **Backup** lets you download a zip of your printers, history, spool-tray links and notification settings, and restore from one later.
+
+- Printer access codes (CC2 MQTT password, Moonraker/PrusaLink API key) are left out of the download by default — check **Include secrets** if you want them included.
+- Restoring overwrites current data with the backup's contents. A safety copy of whatever was there before is taken automatically first, in case you need to undo it.
+- Spooler **restarts immediately** after a successful restore to apply it everywhere — your browser will reconnect on its own after a few seconds.
+- Automatic backups are taken daily and before version upgrades, kept in `DATA_DIR/backups/` (last 7 by default — see `.env.example` for `SPOOLER_AUTO_BACKUP_DAILY` / `SPOOLER_BACKUP_KEEP`), and listed in the same Settings page for download.
+
+---
+
 ## Spoolman
 
 Spooler integrates with **[Spoolman](https://github.com/Donkie/Spoolman)**, an open-source filament spool manager.
@@ -172,6 +183,14 @@ Spooler integrates with **[Spoolman](https://github.com/Donkie/Spoolman)**, an o
   to disable creation or `SPOOLMAN_DEFAULT_SPOOL_WEIGHT=1000` to change its initial weight.
 
 By default, Spooler proxies the Spoolman UI through itself (so one port covers everything). To redirect the browser directly to Spoolman instead — useful if you run a separate reverse proxy or need better WebSocket support — set `PROXY_SPOOLMAN=false` in your `.env` file.
+
+### Configuring the connection
+
+Settings → **Integrations** lets you change the Spoolman URL, the proxy toggle, and an optional basic-auth username/password (for a Spoolman sitting behind a reverse proxy that requires it) — all without touching `.env` or restarting. **Test connection** checks it immediately. Values set via `.env` still work as the default if nothing's been changed in the UI; set `SPOOLER_LOCK_CONFIG=1` to make environment variables win unconditionally and the fields read-only (for someone hosting Spooler for other people).
+
+The same page also has a **Slicer** field — paste the URL of a browser-based slicer (e.g. a self-hosted [Orca Slicer](https://github.com/linuxserver/docker-orcaslicer)) and a **Slicer** link appears in the sidebar that opens it in a new tab.
+
+**Note:** integration values (including the optional Spoolman password) are stored unencrypted in `DATA_DIR/integrations.json`. Make sure that directory isn't readable by anyone you don't trust.
 
 ---
 
@@ -198,6 +217,19 @@ See [CC2_INTEGRATION.md](CC2_INTEGRATION.md) for full CC2 protocol notes.
 | 3030 | WebSocket – backend ↔ printer (CC1/SDCP) |
 | 3000 | UDP – printer discovery broadcast |
 | 1883 | MQTT – CC2 printer broker (on the printer, not the server) |
+
+## Development
+
+Run the test suite locally:
+
+```
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests run offline against fixtures — no real printer or Spoolman instance needed. CI runs the same suite on every pull request and on pushes to `dev`/`main`; the Docker image is only built and published once tests pass.
+
+`GET /api/health` reports version, uptime, and per-printer connection status (name/type/connected, no IPs or access codes). No login required — it's what the Docker `HEALTHCHECK` and any external uptime monitoring hit.
 
 ## Stack
 

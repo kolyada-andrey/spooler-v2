@@ -2,11 +2,15 @@
 HTTP request handler: static files + /api/ routes.
 """
 
+import asyncio
 import http.client
 import json
 import ssl
 import socket
 import subprocess
+import tempfile
+import threading
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -20,12 +24,18 @@ from auth import (
     _auth_ok, _check_rate_limit, _create_session, _get_pw_hash, _get_username,
     _has_password, _invalidate_session, _parse_sid, _reset_rate_limit, _save_auth,
 )
-from persistence import DATA_DIR, load_history, save_printers
+from backup import (
+    BACKUP_DIR, RestoreError, create_backup_zip, list_auto_backups, restore_from_zip,
+)
+from features import describe_all as describe_all_features, is_enabled, requires_feature, set_enabled
+from features import FeatureError
+from persistence import DATA_DIR, current_version, load_history, save_printers
 from push import (
     WEBPUSH_AVAILABLE, add_subscription, get_public_key, has_subscriptions,
     load_notif_settings, remove_subscription, save_notif_settings, send_push_all,
 )
-from spoolman import get_spoolman_db, get_spoolman_url
+from spoolman import get_spoolman_db, get_spoolman_url, spoolman_auth_header, test_spoolman_connection
+import config
 
 try:
     import bcrypt as _bcrypt
@@ -37,9 +47,28 @@ KEY_FILE  = DATA_DIR / "key.pem"
 
 MAX_BODY = 100 * 1024 * 1024  # 100 MB
 
-# When true, Spoolman's web UI is proxied through /spoolman/ on this server.
-# When false (default), /spoolman redirects the browser directly to SPOOLMAN_URL.
-PROXY_SPOOLMAN = os.getenv("PROXY_SPOOLMAN", "true").lower() in ("1", "true", "yes")
+_current_version = current_version  # kept as a module-local alias; call sites unchanged
+
+def proxy_spoolman_enabled() -> bool:
+    # Read live (not a module constant) so a change in Settings -> Integrations
+    # takes effect immediately -- every call site below already calls this
+    # function rather than checking a cached value.
+    return config.get("spoolman.proxy")
+
+
+def _server_settings_readonly() -> dict:
+    """Server network/auth settings -- deliberately never editable from the
+    UI (a wrong value here could lock the user out), shown read-only in
+    Settings -> Integrations alongside the fields that ARE editable there."""
+    return {
+        "HTTP_PORT":     os.getenv("HTTP_PORT", "8080"),
+        "HTTPS_PORT":    os.getenv("HTTPS_PORT", "8443"),
+        "WS_PORT":       os.getenv("WS_PORT", "8765"),
+        "WSS_PORT":      os.getenv("WSS_PORT", "8766"),
+        "HTTPS_ENABLED": os.getenv("HTTPS_ENABLED", "true"),
+        "AUTH_ENABLED":  os.getenv("AUTH_ENABLED", "true"),
+        "DATA_DIR":      str(DATA_DIR),
+    }
 
 
 def ensure_ssl_cert() -> bool:
@@ -218,6 +247,7 @@ class SPHandler(SimpleHTTPRequestHandler):
 
     # ── Camera proxy ──────────────────────────────────────────────────────────
 
+    @requires_feature("camera")
     def _proxy_camera(self):
         printer_id = urllib.parse.unquote(self.path[len("/api/camera/"):].split("?")[0])
         p = state.printers.get(printer_id)
@@ -266,6 +296,7 @@ class SPHandler(SimpleHTTPRequestHandler):
     # CC1: http://{ip}:80/thumbnail/{bare_filename}  (no auth needed)
     # CC2: no accessible thumbnail endpoint — skipped client-side
 
+    @requires_feature("camera")
     def _proxy_thumbnail(self):
         rest = self.path[len("/api/thumbnail/"):]
         parts = rest.split("/", 1)
@@ -319,15 +350,19 @@ class SPHandler(SimpleHTTPRequestHandler):
 
     # ── Spoolman proxy ────────────────────────────────────────────────────────
 
+    @requires_feature("spoolman")
     def _proxy_spoolman(self, method: str, path: str, body: bytes | None):
         if not path.startswith("/api/v1/"):
             self._json({"error": "Invalid Spoolman path"}, 400)
             return
         try:
+            headers = spoolman_auth_header()
+            if body:
+                headers["Content-Type"] = "application/json"
             req = urllib.request.Request(
                 f"{get_spoolman_url()}{path}",
                 data=body,
-                headers={"Content-Type": "application/json"} if body else {},
+                headers=headers,
                 method=method,
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -349,6 +384,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._json({"error": f"Spoolman unreachable: {e}"}, 502)
 
+    @requires_feature("spoolman")
     def _proxy_spoolman_ui(self, method: str, sm_path: str, body: bytes | None = None):
         """Proxy Spoolman's own web UI through our server.
 
@@ -356,7 +392,9 @@ class SPHandler(SimpleHTTPRequestHandler):
         /spoolman/ prefix (required because Spoolman uses paths like /assets/...).
         """
         try:
-            headers = {"Content-Type": "application/json"} if body else {}
+            headers = spoolman_auth_header()
+            if body:
+                headers["Content-Type"] = "application/json"
             req = urllib.request.Request(
                 f"{get_spoolman_url()}{sm_path}",
                 data=body,
@@ -478,9 +516,11 @@ class SPHandler(SimpleHTTPRequestHandler):
         if self.path == "/config.js":
             ws_port  = int(os.getenv("WS_PORT",  "8765"))
             wss_port = int(os.getenv("WSS_PORT", "8766"))
+            ws_host  = os.getenv("WS_HOST", "")
             body = (
                 f"window.SPOOLER_WS_PORT  = {ws_port};\n"
                 f"window.SPOOLER_WSS_PORT = {wss_port};\n"
+                f"window.SPOOLER_WS_HOST  = {json.dumps(ws_host)};\n"
             ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/javascript")
@@ -491,7 +531,7 @@ class SPHandler(SimpleHTTPRequestHandler):
             return
         # Spoolman — either proxy through our server or redirect directly to it
         if self.path in ("/spoolman", "/spoolman/"):
-            if PROXY_SPOOLMAN:
+            if proxy_spoolman_enabled():
                 if self.path == "/spoolman":
                     self.send_response(302)
                     self.send_header("Location", "/spoolman/")
@@ -503,19 +543,40 @@ class SPHandler(SimpleHTTPRequestHandler):
                 self.send_header("Location", get_spoolman_url() + "/")
                 self.end_headers()
             return
-        if PROXY_SPOOLMAN and self.path.startswith("/spoolman/"):
+        if proxy_spoolman_enabled() and self.path.startswith("/spoolman/"):
             sm_path = self.path[len("/spoolman"):]
             self._proxy_spoolman_ui("GET", sm_path or "/")
             return
         # Spoolman's own JS calls /api/v1/ directly — only proxy when enabled
-        if PROXY_SPOOLMAN and self.path.startswith("/api/v1/"):
+        if proxy_spoolman_enabled() and self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("GET", self.path)
             return
         if self.path == "/api/auth-status":
             resp = {"setup_required": not _has_password()}
             if _auth_ok(self):
-                resp["spoolman_url"] = "/spoolman/" if PROXY_SPOOLMAN else get_spoolman_url() + "/"
+                resp["spoolman_url"] = "/spoolman/" if proxy_spoolman_enabled() else get_spoolman_url() + "/"
             self._json(resp)
+            return
+
+        if self.path == "/api/health":
+            # No auth required — this is what Docker's HEALTHCHECK and external
+            # monitoring hit, which won't carry a session cookie. Only reports
+            # connection liveness, nothing sensitive (no IPs, no access codes).
+            import time as _time
+            self._json({
+                "status":   "ok",
+                "version":  _current_version(),
+                "uptime_s": round(_time.time() - state.START_TIME),
+                "printers": [
+                    {
+                        "id":        p.id,
+                        "name":      p.name,
+                        "type":      p.printer_type,
+                        "connected": p.connected,
+                    }
+                    for p in state.printers.values()
+                ],
+            })
             return
 
         if self.path == "/api/push-public-key":
@@ -530,13 +591,24 @@ class SPHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/notification-settings":
             if not self._check_auth():
                 return
+            if not is_enabled("notifications"):
+                self._json({"error": "feature_disabled", "feature": "notifications"}, 403)
+                return
             self._json(load_notif_settings())
             return
 
         if not self._check_auth():
             return
 
-        if self.path.startswith("/api/camera/"):
+        if self.path == "/api/features":
+            self._json(describe_all_features())
+        elif self.path == "/api/integrations":
+            self._json({
+                "fields": config.describe_all(),
+                "tests": {"spoolman": config.last_test_result("spoolman")},
+                "server_settings": _server_settings_readonly(),
+            })
+        elif self.path.startswith("/api/camera/"):
             self._proxy_camera()
         elif self.path.startswith("/api/thumbnail/"):
             self._proxy_thumbnail()
@@ -545,6 +617,9 @@ class SPHandler(SimpleHTTPRequestHandler):
         elif self.path == "/api/history":
             self._json(load_history())
         elif self.path.startswith("/api/lookup-ean"):
+            if not is_enabled("spoolman"):
+                self._json({"error": "feature_disabled", "feature": "spoolman"}, 403)
+                return
             qs     = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
             ean    = params.get("ean", [""])[0].strip()
@@ -558,6 +633,9 @@ class SPHandler(SimpleHTTPRequestHandler):
                     return
             self._json({"error": "Not found"}, 404)
         elif self.path == "/api/filament-meta":
+            if not is_enabled("spoolman"):
+                self._json({"error": "feature_disabled", "feature": "spoolman"}, 403)
+                return
             db     = get_spoolman_db()
             brands = sorted({item.get("manufacturer", "") for item in db if item.get("manufacturer")})
             mat_map: dict = {}
@@ -568,10 +646,19 @@ class SPHandler(SimpleHTTPRequestHandler):
                     mat_map[mat] = den
             materials = [{"name": m, "density": mat_map[m]} for m in sorted(mat_map)]
             self._json({"brands": brands, "materials": materials})
+        elif self.path == "/api/backup" or self.path.startswith("/api/backup?"):
+            self._handle_backup_download()
+        elif self.path == "/api/backups":
+            if not is_enabled("backup"):
+                self._json({"error": "feature_disabled", "feature": "backup"}, 403)
+                return
+            self._json(list_auto_backups())
+        elif self.path.startswith("/api/backups/"):
+            self._handle_backup_file_download()
         elif self.path.startswith("/api/spoolman"):
             self._proxy_spoolman("GET", self.path[len("/api/spoolman"):], None)
         elif (
-            PROXY_SPOOLMAN
+            proxy_spoolman_enabled()
             and "text/html" in self.headers.get("Accept", "")
             and self.path not in ("/", "")
             and not Path(self.path.split("?")[0]).suffix
@@ -586,7 +673,7 @@ class SPHandler(SimpleHTTPRequestHandler):
             local = Path(__file__).parent / "public" / path_part
             if local.is_file():
                 super().do_GET()
-            elif PROXY_SPOOLMAN and Path(path_part).suffix:
+            elif proxy_spoolman_enabled() and Path(path_part).suffix:
                 self._proxy_spoolman_ui("GET", self.path.split("?")[0])
             else:
                 super().do_GET()
@@ -594,7 +681,13 @@ class SPHandler(SimpleHTTPRequestHandler):
     def do_PATCH(self):
         if not self._check_auth():
             return
-        if PROXY_SPOOLMAN and self.path.startswith("/api/v1/"):
+        if self.path == "/api/features":
+            self._handle_patch_features()
+            return
+        if self.path == "/api/integrations":
+            self._handle_patch_integrations()
+            return
+        if proxy_spoolman_enabled() and self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("PATCH", self.path, self._read_body())
             return
         if self.path.startswith("/api/spoolman"):
@@ -605,7 +698,7 @@ class SPHandler(SimpleHTTPRequestHandler):
     def do_DELETE(self):
         if not self._check_auth():
             return
-        if PROXY_SPOOLMAN and self.path.startswith("/api/v1/"):
+        if proxy_spoolman_enabled() and self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("DELETE", self.path)
             return
         if self.path.startswith("/api/spoolman"):
@@ -640,6 +733,10 @@ class SPHandler(SimpleHTTPRequestHandler):
             self._handle_push_test()
         elif self.path == "/api/import-filaments":
             self._handle_import_filaments()
+        elif self.path == "/api/integrations/spoolman/test":
+            self._handle_test_spoolman()
+        elif self.path == "/api/restore":
+            self._handle_restore()
         elif self.path.startswith("/api/v1/"):
             self._proxy_spoolman_ui("POST", self.path, self._read_body())
         elif self.path.startswith("/api/spoolman"):
@@ -658,6 +755,7 @@ class SPHandler(SimpleHTTPRequestHandler):
 
     # ── Complex POST handlers ─────────────────────────────────────────────────
 
+    @requires_feature("notify_webpush")
     def _handle_push_subscribe(self):
         try:
             sub = json.loads(self._read_body() or b"{}")
@@ -671,6 +769,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         add_subscription(sub)
         self._json({"ok": True})
 
+    @requires_feature("notify_webpush")
     def _handle_push_unsubscribe(self):
         try:
             body = json.loads(self._read_body() or b"{}")
@@ -680,6 +779,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         remove_subscription(body.get("endpoint", ""))
         self._json({"ok": True})
 
+    @requires_feature("notifications")
     def _handle_notif_settings(self):
         try:
             s = json.loads(self._read_body() or b"{}")
@@ -689,6 +789,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         save_notif_settings(s)
         self._json({"ok": True})
 
+    @requires_feature("notify_webpush")
     def _handle_push_test(self):
         self._read_body()
         if not WEBPUSH_AVAILABLE:
@@ -700,6 +801,7 @@ class SPHandler(SimpleHTTPRequestHandler):
         send_push_all("Spooler — Test notification", "Push notifications are working!")
         self._json({"ok": True})
 
+    @requires_feature("spoolman")
     def _handle_import_filaments(self):
         try:
             req_body = json.loads(self._read_body() or b"{}")
@@ -798,6 +900,164 @@ class SPHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
+    # ── Backup / restore ─────────────────────────────────────────────────────
+
+    @requires_feature("backup")
+    def _handle_backup_download(self):
+        qs = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(qs)
+        include_secrets = params.get("include_secrets", ["0"])[0].lower() in ("1", "true", "yes")
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip")
+        os.close(tmp_fd)
+        try:
+            manifest = create_backup_zip(Path(tmp_name), include_secrets=include_secrets)
+            data = Path(tmp_name).read_bytes()
+        except Exception as e:
+            self._json({"error": f"Backup failed: {e}"}, 500)
+            return
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        date = time.strftime("%Y-%m-%d")
+        filename = f"spooler-backup-{manifest['spooler_version']}-{date}.zip"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    @requires_feature("backup")
+    def _handle_backup_file_download(self):
+        # Only ever resolve by exact match against what list_auto_backups()
+        # itself already reports -- the requested name is never joined onto
+        # a filesystem path, so a "../.." in it just fails to match anything.
+        name = urllib.parse.unquote(self.path[len("/api/backups/"):].split("?")[0])
+        if name not in {b["name"] for b in list_auto_backups()}:
+            self._json({"error": "Not found"}, 404)
+            return
+        data = (BACKUP_DIR / name).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    @requires_feature("backup")
+    def _handle_restore(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._json({"error": "No file uploaded"}, 400)
+            return
+        body = self._read_body()
+        if body is None:
+            return  # _read_body() already sent a 413 if the body was too large
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip")
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(body)
+            manifest = restore_from_zip(Path(tmp_name))
+        except RestoreError as e:
+            self._json({"error": str(e)}, 400)
+            return
+        except Exception as e:
+            self._json({"error": f"Restore failed: {e}"}, 500)
+            return
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        self._json({
+            "ok": True,
+            "manifest": manifest,
+            "message": "Restored. Spooler is restarting — reload this page in a few seconds.",
+        })
+        # In-memory state (loaded printer connections and their live asyncio
+        # tasks, the cached VAPID key, auth sessions) can't be safely swapped
+        # out from under a running process -- a controlled restart is the
+        # robust way to pick up the restored files everywhere. Delayed so the
+        # response above actually reaches the client first. Docker's
+        # restart: unless-stopped brings the container back automatically;
+        # outside Docker the process needs restarting by hand.
+        threading.Timer(1.0, lambda: os._exit(0)).start()
+
+    # ── Feature flags ─────────────────────────────────────────────────────────
+
+    def _handle_patch_features(self):
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except Exception:
+            self._json({"error": "Bad request"}, 400)
+            return
+        key = body.get("key")
+        enabled = body.get("enabled")
+        if not isinstance(key, str) or not isinstance(enabled, bool):
+            self._json({"error": "Expected {\"key\": str, \"enabled\": bool}"}, 400)
+            return
+        try:
+            cascaded = set_enabled(key, enabled)
+        except FeatureError as e:
+            self._json({"error": str(e)}, 400)
+            return
+        features = describe_all_features()
+        self._json({"ok": True, "features": features, "cascaded": cascaded})
+        # Broadcasting runs on the asyncio loop, this handler runs on its own
+        # HTTP request thread -- _ws_loop is the same loop reference the combo
+        # WebSocket adopter below already uses to bridge threads safely.
+        if _ws_loop is not None:
+            asyncio.run_coroutine_threadsafe(
+                state.broadcast_to_browsers({"type": "features_changed", "features": features}),
+                _ws_loop,
+            )
+
+    # ── Integrations config ──────────────────────────────────────────────────
+
+    def _handle_patch_integrations(self):
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except Exception:
+            self._json({"error": "Bad request"}, 400)
+            return
+        values = body.get("values", {})
+        clear_keys = body.get("clear", [])
+        if not isinstance(values, dict) or not isinstance(clear_keys, list):
+            self._json({"error": 'Expected {"values": {...}, "clear": [...]}'}, 400)
+            return
+
+        errors = {}
+        for key, value in values.items():
+            field = config.FIELDS.get(key)
+            if field is None:
+                errors[key] = "Unknown field"
+                continue
+            if field.type == "secret" and value == "":
+                continue  # blank secret field on save means "leave unchanged"
+            try:
+                config.set(key, value)
+            except config.ConfigError as e:
+                errors[key] = str(e)
+        for key in clear_keys:
+            try:
+                config.clear(key)
+            except config.ConfigError as e:
+                errors[key] = str(e)
+
+        if errors:
+            self._json({"error": "Some fields could not be updated", "fields": errors}, 400)
+            return
+        self._json({"ok": True, "fields": config.describe_all()})
+
+    @requires_feature("spoolman")
+    def _handle_test_spoolman(self):
+        self._read_body()
+        result = test_spoolman_connection()
+        config.record_test_result("spoolman", result["ok"], result["message"])
+        self._json(result)
+
     # ── Response helper ───────────────────────────────────────────────────────
 
     def _json(self, data, code: int = 200):
@@ -809,8 +1069,98 @@ class SPHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
+# ── WebSocket-on-the-same-port ("combo") ─────────────────────────────────────
+#
+# The browser WebSocket normally lives on its own port (WS_PORT/WSS_PORT).
+# That's unreachable through single-port reverse proxies / tunnels (e.g. a
+# Cloudflare Tunnel hostname mapped to just http://<ip>:8080), so the plain
+# HTTP server here can also adopt WebSocket upgrade requests and hand the raw
+# socket off to the asyncio WS server — same origin, same port, no extra
+# tunnel/proxy config needed. HTTPS is not combo'd: TLS must be terminated
+# before the request line is visible, so PWA installs over the self-signed
+# cert on HTTPS_PORT keep using the separate WSS_PORT.
+
+_ws_loop = None
+_ws_connection_factory = None
+
+
+def set_ws_adopter(loop, connection_factory) -> None:
+    """Register the asyncio loop + WS connection factory that combo mode
+    hands adopted sockets to. Must be called before run_http()'s server
+    starts accepting connections."""
+    global _ws_loop, _ws_connection_factory
+    _ws_loop = loop
+    _ws_connection_factory = connection_factory
+
+
+def _looks_like_ws_upgrade(sock, timeout: float = 1.0) -> bool:
+    """Peek (non-destructively) at the start of a freshly accepted connection
+    to see if it's an HTTP WebSocket upgrade request, without consuming any
+    bytes — so the request is still intact for whichever handler takes it."""
+    deadline = time.time() + timeout
+    sock.settimeout(0.2)
+    data = b""
+    try:
+        while time.time() < deadline:
+            try:
+                data = sock.recv(4096, socket.MSG_PEEK)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not data or b"\r\n\r\n" in data or len(data) > 1024:
+                break
+    finally:
+        sock.settimeout(None)
+    head = data.split(b"\r\n\r\n", 1)[0].lower()
+    return b"upgrade" in head and b"websocket" in head
+
+
+def _adopt_ws_socket(sock, client_address) -> None:
+    async def _do():
+        try:
+            await _ws_loop.connect_accepted_socket(_ws_connection_factory, sock)
+        except Exception as e:
+            print(f"[WS] Combo adopt failed for {client_address}: {e}")
+            try:
+                sock.close()
+            except Exception:
+                pass
+    asyncio.run_coroutine_threadsafe(_do(), _ws_loop)
+
+
+class ComboHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that also accepts WebSocket upgrades on the same
+    port (see module note above)."""
+
+    def process_request(self, request, client_address):
+        if _ws_loop is None:
+            super().process_request(request, client_address)
+            return
+        # _looks_like_ws_upgrade() blocks for up to ~1s on a slow/silent
+        # client. process_request() runs on the server's single accept-loop
+        # thread (socketserver dispatches to a new thread *inside*
+        # ThreadingHTTPServer.process_request, not before it), so peeking
+        # here directly would stall accepting any other connection while it
+        # waits. Hand off to a thread immediately instead, same as
+        # ThreadingMixIn normally does for the HTTP-only path.
+        t = threading.Thread(target=self._route_request, args=(request, client_address), daemon=True)
+        t.start()
+
+    def _route_request(self, request, client_address):
+        if _looks_like_ws_upgrade(request):
+            _adopt_ws_socket(request, client_address)
+            return
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+
+
 def run_http(port: int) -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", port), SPHandler)
+    server = ComboHTTPServer(("0.0.0.0", port), SPHandler)
     print(f"[HTTP] Serving on http://0.0.0.0:{port}")
     server.serve_forever()
 

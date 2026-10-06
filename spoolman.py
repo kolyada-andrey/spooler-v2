@@ -3,15 +3,16 @@ Spoolman integration: filament database and spool deduction.
 """
 
 import asyncio
+import base64
 import json
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
-import os
-
+import config
 import state as _state
 from persistence import FILAMENT_DENSITY
 from push import load_notif_settings, send_push_all
@@ -482,12 +483,57 @@ def _printer_location(printer_id: str) -> str:
     p = _state.printers.get(printer_id)
     return p.name if p else printer_id
 
-SPOOLMAN_URL    = os.getenv("SPOOLMAN_URL", "http://localhost:7912").rstrip("/")
 SPOOLMAN_DB_URL = "https://donkie.github.io/SpoolmanDB/filaments.json"
 
 
 def get_spoolman_url() -> str:
-    return SPOOLMAN_URL
+    # Read live every call (not a module constant) so a change made in
+    # Settings -> Integrations takes effect immediately, no restart needed --
+    # every one of this module's Spoolman calls already funnels through here.
+    return config.get("spoolman.url")
+
+
+def spoolman_auth_header() -> dict:
+    """Basic-auth header for Spoolman, if configured (e.g. Spoolman sitting
+    behind a reverse proxy that requires it) -- empty dict otherwise."""
+    user = config.get("spoolman.auth_user")
+    if not user:
+        return {}
+    pw = config.get("spoolman.auth_pass")
+    token = base64.b64encode(f"{user}:{pw}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def _spoolman_request(url: str, method: str = "GET", body: bytes | None = None) -> urllib.request.Request:
+    """Build a Request with the configured basic-auth header attached (a
+    no-op header-wise when none is configured) -- every direct Spoolman call
+    in this module goes through this so reverse-proxy basic auth, once set,
+    covers all of them uniformly, not just the browser-facing UI proxy."""
+    headers = spoolman_auth_header()
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    return urllib.request.Request(url, data=body, headers=headers, method=method)
+
+
+def test_spoolman_connection() -> dict:
+    """GET /api/v1/health -- verified directly against a real running Spoolman
+    instance (not guessed), returns {"status": "healthy"}. Lightest possible
+    check that still proves the URL, network path, and basic auth (if any)
+    all actually work."""
+    url = get_spoolman_url()
+    start = time.time()
+    try:
+        req = _spoolman_request(f"{url}/api/v1/health")
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        elapsed_ms = round((time.time() - start) * 1000)
+        return {"ok": True, "message": f"Connected in {elapsed_ms} ms"}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "message": f"HTTP {e.code} from {url}"}
+    except Exception as e:
+        return {"ok": False, "message": f"Could not reach {url}: {e}"}
+
+
 SPOOLMAN_DB_TTL  = 3600  # re-fetch at most once per hour
 
 _spoolman_db: list | None = None
@@ -520,7 +566,7 @@ def get_spool_density(printer_id: str) -> float:
     try:
         base = get_spoolman_url()
         url = f"{base}/api/v1/spool?location={urllib.parse.quote(loc)}"
-        with urllib.request.urlopen(url, timeout=3) as resp:
+        with urllib.request.urlopen(_spoolman_request(url), timeout=3) as resp:
             data = json.loads(resp.read())
         if data:
             density = data[0].get("filament", {}).get("density")
@@ -536,11 +582,9 @@ def spoolman_set_location(spool_id: int, printer_id: str) -> None:
     loc = _printer_location(printer_id)
     try:
         base = get_spoolman_url()
-        req = urllib.request.Request(
+        req = _spoolman_request(
             f"{base}/api/v1/spool/{spool_id}",
-            data=json.dumps({"location": loc}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="PATCH",
+            method="PATCH", body=json.dumps({"location": loc}).encode(),
         )
         urllib.request.urlopen(req, timeout=3).close()
         print(f"[Spoolman] Spool {spool_id} location → {loc}")
@@ -559,24 +603,20 @@ def spoolman_assign(printer_id: str, spool_id: int | None) -> None:
         base = get_spoolman_url()
         # Find currently assigned spool and clear it
         url = f"{base}/api/v1/spool?location={urllib.parse.quote(loc)}"
-        with urllib.request.urlopen(url, timeout=3) as resp:
+        with urllib.request.urlopen(_spoolman_request(url), timeout=3) as resp:
             current = json.loads(resp.read())
         for s in current:
             if spool_id is None or s["id"] != spool_id:
-                req = urllib.request.Request(
+                req = _spoolman_request(
                     f"{base}/api/v1/spool/{s['id']}",
-                    data=json.dumps({"location": ""}).encode(),
-                    headers={"Content-Type": "application/json"},
-                    method="PATCH",
+                    method="PATCH", body=json.dumps({"location": ""}).encode(),
                 )
                 urllib.request.urlopen(req, timeout=3).close()
         # Assign the new spool
         if spool_id is not None:
-            req = urllib.request.Request(
+            req = _spoolman_request(
                 f"{base}/api/v1/spool/{spool_id}",
-                data=json.dumps({"location": loc}).encode(),
-                headers={"Content-Type": "application/json"},
-                method="PATCH",
+                method="PATCH", body=json.dumps({"location": loc}).encode(),
             )
             urllib.request.urlopen(req, timeout=3).close()
             print(f"[Spoolman] Spool {spool_id} → {loc}")
@@ -624,12 +664,7 @@ def spoolman_deduct_spool(
     try:
         base = get_spoolman_url()
         body = json.dumps({"use_weight": round(amount_g, 1)}).encode()
-        req = urllib.request.Request(
-            f"{base}/api/v1/spool/{spool_id}/use",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="PUT",
-        )
+        req = _spoolman_request(f"{base}/api/v1/spool/{spool_id}/use", method="PUT", body=body)
         with urllib.request.urlopen(req, timeout=3) as resp:
             result = json.loads(resp.read())
         name = result.get("filament", {}).get("name") or f"Spool {spool_id}"
@@ -650,7 +685,7 @@ def spoolman_deduct(printer_id: str, amount_g: float, loop: asyncio.AbstractEven
     try:
         base = get_spoolman_url()
         url = f"{base}/api/v1/spool?location={urllib.parse.quote(loc)}"
-        with urllib.request.urlopen(url, timeout=3) as resp:
+        with urllib.request.urlopen(_spoolman_request(url), timeout=3) as resp:
             data = json.loads(resp.read())
         if not data:
             return

@@ -1,5 +1,26 @@
 [
   {
+    "version": "2.2.6",
+    "date": "2026-10-05",
+    "changes": [
+      "Backup and restore — download a backup, restore from a backup file, automatic daily and pre-upgrade safety backups with a configurable interval (Settings → Backup)",
+      "Settings → Features — toggle Camera, Backup, Notifications, Spoolman and Web Push on/off; disabled features are also hidden from the relevant Settings pages",
+      "Settings → Advanced → Integrations — configure the Spoolman URL and an optional Slicer link from the UI with no restart needed; optional Spoolman basic-auth for reverse-proxied setups",
+      "Print cards now show an estimated finish time (e.g. 'Done ~14:35', 'Done tomorrow 06:10'), hidden while paused in favor of a note that it'll update once the print resumes",
+      "Connection-loss banner with automatic reconnect and full state refresh when the browser loses its connection to Spooler; printer cards show 'last updated Xs/m/h ago' and dim when data is stale",
+      "Status indicator redesigned to read the printer's normalized state directly so the dot and badge can no longer disagree; shows the printer's error code when known",
+      "Printer cards show why a print paused, stopped, or errored when that information is available (e.g. triggered from Spooler vs. by the printer itself)",
+      "CC2 now shows firmware version and model under the printer name, like CC1 already did",
+      "CC2: more accurate status during homing, auto-leveling and bed-preheating phases; known error codes (e.g. leveling failure) now show a readable message instead of just a number",
+      "CC2: shows 'Camera not connected on printer' when the printer itself reports no camera module, instead of a generic connection failure",
+      "Fixed camera feed not resuming after the app was backgrounded for a while on mobile/PWA — now reconnects automatically when you return to the app",
+      "Fixed CC2 light control after a firmware update started requiring both brightness and power parameters",
+      "Printer card polish — readable 'no spool' text in Canvas slots, full spool name shown on linked trays, accessible light-on/off button with a clearer style, a 'light off' overlay with one-tap toggle over a dark camera feed, cards use the available width better",
+      "Fixed print-history bugs: completion occasionally missed when only detected via polling instead of a push update, a race condition that could corrupt history.json under concurrent writes, and filament-usage tracking incorrectly resetting on every pause/resume cycle",
+      "Expanded automated test suite (174 tests) and CI pipeline gating releases"
+    ]
+  },
+  {
     "version": "2.2.5",
     "date": "2026-06-22",
     "changes": [

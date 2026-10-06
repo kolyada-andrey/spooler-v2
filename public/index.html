@@ -11,7 +11,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="Spooler" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <link rel="stylesheet" href="style.css?v=29" />
+  <link rel="stylesheet" href="style.css?v=36" />
 </head>
 <body>
   <header>
@@ -35,6 +35,10 @@
     </div>
   </header>
 
+  <div id="conn-banner" class="conn-banner" hidden>
+    Lost connection to Spooler — retrying…
+  </div>
+
   <div class="app-body">
 
   <nav class="sidenav">
@@ -52,6 +56,13 @@
       </svg>
       <span>Spools</span>
     </button>
+    <a id="btn-slicer" class="sidenav-item" title="Open slicer" target="_blank" rel="noopener" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+      </svg>
+      <span>Slicer</span>
+    </a>
     <button id="btn-app-settings" class="sidenav-item" title="Settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <circle cx="12" cy="12" r="3"/>
@@ -392,6 +403,30 @@
             <span>Notifications</span>
             <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
           </button>
+          <button class="settings-menu-item" id="btn-settings-goto-backup">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            <span>Backup</span>
+            <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
+          <button class="settings-menu-item" id="btn-settings-goto-features">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/>
+              <circle cx="4" cy="12" r="2"/><circle cx="12" cy="10" r="2"/><circle cx="20" cy="14" r="2"/>
+            </svg>
+            <span>Features</span>
+            <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
+          <button class="settings-menu-item" id="btn-settings-goto-integrations">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
+              <path d="M20 4 8.12 15.88M14.47 14.48 20 20M8.12 8.12 12 12"/>
+            </svg>
+            <span>Integrations</span>
+            <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
           <div class="settings-menu-item settings-toggle-row">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
@@ -550,6 +585,71 @@
           <button id="btn-notif-save" class="btn btn-primary">Save</button>
         </div>
       </div>
+      <!-- Backup sub-page -->
+      <div id="settings-backup" style="display:none">
+        <div class="settings-subpage-header">
+          <button id="btn-settings-back-backup" class="settings-back-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
+          <h3>Backup</h3>
+        </div>
+
+        <div class="backup-section">
+          <h4>Download backup</h4>
+          <p class="backup-desc">Printers, history, spool-tray links and notification settings.</p>
+          <label class="backup-checkbox-row">
+            <input type="checkbox" id="backup-include-secrets" />
+            <span>Include secrets (printer access codes) — off by default; without them, codes must be re-entered after restoring</span>
+          </label>
+          <button id="btn-backup-download" class="btn btn-primary">Download backup</button>
+        </div>
+
+        <div class="backup-section">
+          <h4>Restore from file</h4>
+          <p class="backup-desc backup-warning">This overwrites current printers, history and settings. A safety copy of the current state is taken automatically first. Spooler restarts immediately after.</p>
+          <input type="file" id="backup-restore-file" accept=".zip" />
+          <button id="btn-backup-restore" class="btn btn-danger">Restore</button>
+        </div>
+
+        <div class="backup-section">
+          <h4>Automatic backups</h4>
+          <p class="backup-desc">Also always taken before version upgrades. Last 7 are kept.</p>
+          <label class="backup-interval-row">
+            <span>Interval (days, 0 to disable)</span>
+            <input type="number" id="backup-interval-days" min="0" step="1" style="width:70px" />
+          </label>
+          <button id="btn-backup-interval-save" class="btn btn-secondary btn-sm">Save interval</button>
+          <div id="backup-auto-list" class="backup-auto-list"></div>
+        </div>
+      </div>
+      <!-- Features sub-page -->
+      <div id="settings-features" style="display:none">
+        <div class="settings-subpage-header">
+          <button id="btn-settings-back-features" class="settings-back-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
+          <h3>Features</h3>
+        </div>
+        <div id="features-list" class="features-list"></div>
+      </div>
+      <!-- Integrations sub-page -->
+      <div id="settings-integrations" style="display:none">
+        <div class="settings-subpage-header">
+          <button id="btn-settings-back-integrations" class="settings-back-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
+          <h3>Integrations</h3>
+        </div>
+        <p class="integrations-warning">Changes here affect connections to other services.</p>
+        <div id="integrations-list"></div>
+        <div class="modal-actions">
+          <button id="btn-integrations-save" class="btn btn-primary">Save</button>
+        </div>
+        <div class="integrations-server-settings">
+          <h4>Server setup (change in .env)</h4>
+          <div id="integrations-server-settings-list" class="integrations-server-grid"></div>
+        </div>
+      </div>
       <!-- Change password sub-page -->
       <div id="settings-change-password" style="display:none">
         <div class="settings-subpage-header">
@@ -589,7 +689,7 @@
 
   <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
   <script src="/config.js"></script>
-  <script src="app.js?v=42"></script>
+  <script src="app.js?v=54"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").catch(() => {});
