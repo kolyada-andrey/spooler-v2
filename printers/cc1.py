@@ -7,6 +7,7 @@ import json
 import re
 
 import state
+from persistence import dump_raw_message
 from printers.base import PrinterConnection
 from printers.protocol import (
     CMD_ATTRS, CMD_CAMERA, CMD_CANVAS, CMD_LIGHT, CMD_LIST_FILES,
@@ -142,6 +143,7 @@ class CC1Connection(PrinterConnection):
             print(f"[Printer {self.name}] Active tray changed → {active_tray}, spool {spool_id}")
 
     async def _handle_message(self, raw: str) -> None:
+        dump_raw_message(self.id, "cc1_ws", raw)
         try:
             msg = json.loads(raw)
         except Exception:
@@ -182,6 +184,11 @@ class CC1Connection(PrinterConnection):
         elif cmd == CMD_STATUS:
             if payload and payload != {"Ack": 0}:
                 self.status = payload
+                # This is the keepalive poller's CMD_STATUS response, not the
+                # printer's unsolicited "Status" push handled above — it still
+                # carries fresh PrintInfo, so transitions must be checked here
+                # too or a print start/end seen only via polling is missed.
+                await self._check_print_transition()
         elif cmd == CMD_CAMERA:
             url = payload.get("VideoUrl") or payload.get("Url")
             if url:

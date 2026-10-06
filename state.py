@@ -7,9 +7,14 @@ circular imports: nothing here imports from within this project.
 
 import json
 import os
+import time
 
 # Set DEBUG=1 in the environment to enable verbose MQTT/protocol logging.
 DEBUG: bool = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
+
+# Set once, the first time this module is imported — which happens very early
+# in process startup — so (time.time() - START_TIME) is the server's uptime.
+START_TIME: float = time.time()
 
 # { printer_id: PrinterConnection }
 printers: dict = {}
